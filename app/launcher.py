@@ -85,7 +85,7 @@ def main():
 def render_home_page():
     """홈 페이지 렌더링"""
     
-    col1, col2 = st.columns()
+    col1, col2 = st.columns(2)
     
     with col1:
         st.markdown("""
