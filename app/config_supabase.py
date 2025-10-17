@@ -10,13 +10,13 @@ import streamlit as st
 # Supabase 설정 (Streamlit Secrets에서 로드)
 # ============================================================================
 # .streamlit/secrets.toml 파일의 [supabase] 섹션을 사용합니다.
+# 체험판 전용: 무조건 체험판 DB 사용
 try:
     SUPABASE_URL = st.secrets["supabase"]["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["supabase"]["SUPABASE_KEY"]
-except Exception:
-    # Fallback: 환경 변수에서 직접 읽기 (로컬 개발용)
-    SUPABASE_URL = os.getenv("SUPABASE_URL")
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+except (KeyError, AttributeError):
+    st.error("⚠️ 체험판 Supabase 접속 정보가 .streamlit/secrets.toml에 없습니다.")
+    st.stop()
 
 # DB 모드 선택
 USE_SUPABASE = True  # True: Supabase 사용, False: SQLite 사용 (롤백용)

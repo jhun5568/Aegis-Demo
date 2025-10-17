@@ -23,16 +23,13 @@ try:
 except:
     TENANT_ID = os.getenv('TENANT_ID', 'dooho')  # 기본값: dooho
 
-# tenant_id에서 회사명 매핑 (한글 인코딩 문제 방지)
-COMPANY_MAP = {
-    'dooho': '두호',
-    'kukje': '국제',
-}
-COMPANY_NAME = COMPANY_MAP.get(TENANT_ID, TENANT_ID)
+# 체험판 전용 설정
+TENANT_ID = 'demo'
+COMPANY_NAME = 'Aegis-DX 체험판'
 
 st.set_page_config(
-    page_title=f"{COMPANY_NAME} 자동화 시스템",
-    page_icon="🛠️",
+    page_title="🎯 Aegis-DX 무료 체험판",
+    page_icon="🎯",
     layout="wide"
 )
 
@@ -56,7 +53,7 @@ def main():
     user = get_current_user()
 
     # 회사명 표시
-    st.subheader(f"🏢 {COMPANY_NAME} 자동화 시스템")
+    st.subheader(f"� {COMPANY_NAME} 자동화 시스템")
 
     if not user:
         st.info("이용을 위해 로그인이 필요합니다.")
@@ -275,16 +272,8 @@ def render_wip_app():
 
         # auth_manager를 통해 사용자가 접근할 수 있는 테넌트 목록 가져오기
         from app.config_supabase import get_auth_manager
-        auth_manager = get_auth_manager()
-        # 사용자별 허용 테넌트 목록은 세션 캐시
-        _ak = f"allowed_tenants::{user['email']}"
-        if _ak not in st.session_state:
-            st.session_state[_ak] = auth_manager.get_allowed_tenants(user['email'])
-        allowed_tenants = st.session_state[_ak]
-
-        if not allowed_tenants:
-            st.error("접근 가능한 업체 정보가 없습니다. 관리자에게 문의하세요.")
-            return
+        # 체험판에서는 'demo' 테넌트만 허용
+        allowed_tenants = ['demo']
 
         print(f"[INFO] Loading WIP app v0.9 for user: {user['email']} with tenants: {allowed_tenants}")
 
