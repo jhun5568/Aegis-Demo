@@ -1,0 +1,8 @@
+                        try:
+                            _self.db.get_projects.clear()
+                            _self.db.get_orders.clear()
+                            _self.db.get_process_events.clear()
+                            _self.wip.get_projects_with_orders.clear()
+                            _self.wip.get_dashboard_stats.clear()
+                        except Exception:
+                            pass

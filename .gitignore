@@ -1,0 +1,10 @@
+# 운영 기밀 정보
+.streamlit/secrets.toml
+database/*.db
+database/backup/
+auth/*.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
