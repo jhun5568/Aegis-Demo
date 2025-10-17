@@ -1,4 +1,4 @@
-# Project Aegis - 앱 런처
+# Project Aegis - 앱 런처 (체험판)
 # 사용자가 원하는 앱을 선택할 수 있는 메인 런처
 # 작성일: 2025.09.29
 
@@ -14,14 +14,6 @@ if ROOT not in sys.path:
 import streamlit as st
 from auth.session_manager import get_current_user, logout_button
 from auth.auth_ui import render_auth_gate, topbar_user
-
-# 환경변수 또는 URL 파라미터에서 회사 정보 읽기
-# URL 파라미터 우선 (Streamlit Cloud용), 없으면 환경변수 (로컬용)
-try:
-    url_tenant = st.query_params.get("tenant", None)
-    TENANT_ID = url_tenant if url_tenant else os.getenv('TENANT_ID', 'dooho')
-except:
-    TENANT_ID = os.getenv('TENANT_ID', 'dooho')  # 기본값: dooho
 
 # 체험판 전용 설정
 TENANT_ID = 'demo'
@@ -53,7 +45,8 @@ def main():
     user = get_current_user()
 
     # 회사명 표시
-    st.subheader(f"� {COMPANY_NAME} 자동화 시스템")
+    st.subheader(f"🎯 {COMPANY_NAME}")
+    st.info("✨ **무료 체험판**입니다. 샘플 데이터로 모든 기능을 체험하실 수 있습니다.")
 
     if not user:
         st.info("이용을 위해 로그인이 필요합니다.")
@@ -62,28 +55,7 @@ def main():
     else:
         logout_button(key="logout_main")
 
-    # 라이선스 체크 (로그인 후)
-    try:
-        from app.config_supabase import get_supabase_client
-        from utils.license_manager import check_and_enforce_license
-
-        # 라이선스 체크는 테넌트별 1회만 수행
-        _lic_key = f"license_checked::{TENANT_ID}"
-        if _lic_key not in st.session_state:
-            try:
-                supabase = get_supabase_client()
-                check_and_enforce_license(supabase, TENANT_ID)
-            except Exception as license_error:
-                st.warning(f"⚠️ 라이선스 서버에 일시적인 문제가 발생했습니다. 기능은 정상적으로 사용 가능합니다.")
-                print(f"[EMERGENCY] License check bypassed due to error: {license_error}")
-            finally:
-                # 성공하든 실패하든 다시 체크하지 않도록 세션 상태 설정
-                st.session_state[_lic_key] = True
-    except ImportError:
-        # 라이선스 관리자가 없으면 경고만 표시
-        print("[WARNING] License manager not found - skipping license check")
-    except Exception as e:
-        print(f"[WARNING] License check failed: {e}")
+    # 라이선스 체크 제거 (체험판 전용)
 
 
     # 사이드바에서 앱 선택
@@ -113,7 +85,7 @@ def main():
 def render_home_page():
     """홈 페이지 렌더링"""
     
-    col1, col2 = st.columns([10, 3])
+    col1, col2 = st.columns()
     
     with col1:
         st.markdown("""
@@ -270,8 +242,6 @@ def render_wip_app():
             st.warning("WIP 앱을 보려면 로그인이 필요합니다.")
             return
 
-        # auth_manager를 통해 사용자가 접근할 수 있는 테넌트 목록 가져오기
-        from app.config_supabase import get_auth_manager
         # 체험판에서는 'demo' 테넌트만 허용
         allowed_tenants = ['demo']
 
