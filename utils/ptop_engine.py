@@ -453,7 +453,7 @@ class PtopEngine:
                 .eq('tenant_id', self.tenant)
 
             if keyword:
-                query = query.or_(f'product_name.ilike.%{keyword}%,standard.ilike.%{keyword}%')
+                query = query.ilike('product_name', f'%{keyword}%')
 
             result = query.order('product_name').execute()
             return pd.DataFrame(result.data)
@@ -469,7 +469,7 @@ class PtopEngine:
                 .eq('tenant_id', self.tenant)
 
             if keyword:
-                query = query.or_(f'product_name.ilike.%{keyword}%,standard.ilike.%{keyword}%')
+                query = query.ilike('product_name', f'%{keyword}%')
 
             result = query.order('product_name').execute()
             return pd.DataFrame(result.data)

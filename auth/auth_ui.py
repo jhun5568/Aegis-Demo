@@ -75,7 +75,12 @@ def render_reset(am: AuthManager):
 
 def render_auth_gate():
     """런처에서 호출하는 인증 게이트(로그인/회원가입/재설정 라우팅)"""
-    am = AuthManager(SUPABASE_URL, SUPABASE_KEY)
+    # 현재 환경변수에서 Supabase 설정 읽기 (데모 테넌트용 동적 설정 지원)
+    import os as _os
+    current_url = _os.getenv("SUPABASE_URL") or SUPABASE_URL
+    current_key = _os.getenv("SUPABASE_KEY") or SUPABASE_KEY
+
+    am = AuthManager(current_url, current_key)
 
     # 자동 로그인 시도 (파일에 저장된 토큰이 있으면)
     if "auth_user" not in st.session_state and "auto_login_attempted" not in st.session_state:

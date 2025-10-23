@@ -15,490 +15,6 @@ import os
 from pathlib import Path
 import os
 
-# Phase 3 auto-transfer helpers
-import time
-import random
-try:
-    from app.db_supabase_adapter import DatabaseManager  # type: ignore
-except Exception:
-    DatabaseManager = None  # type: ignore
-
-try:
-    import json as _json
-except Exception:
-    _json = None
-
-@st.cache_resource(show_spinner=False)
-def _get_phase3_db():
-    if DatabaseManager is None:
-        raise RuntimeError("Phase3 DatabaseManager not available")
-    return DatabaseManager()
-
-def _p3_jsonable(obj):
-    try:
-        from datetime import datetime, date as _date
-        import numpy as _np  # type: ignore
-    except Exception:
-        class _NP:  # fallback
-            integer = ()
-            floating = ()
-        _np = _NP()
-        from datetime import datetime, date as _date
-    if isinstance(obj, dict):
-        return {k: _p3_jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_p3_jsonable(x) for x in obj]
-    if _json is not None:
-        # Normalize pandas/np/datetime to JSON-safe
-        try:
-            import pandas as _pd  # late import
-            if isinstance(obj, _pd.Timestamp):
-                return obj.to_pydatetime().isoformat()
-        except Exception:
-            pass
-    if isinstance(obj, (datetime, _date)):
-        return obj.isoformat()
-    if hasattr(_np, 'integer') and isinstance(obj, _np.integer):
-        return int(obj)
-    if hasattr(_np, 'floating') and isinstance(obj, _np.floating):
-        return float(obj)
-    if hasattr(obj, 'item'):
-        try:
-            return obj.item()
-        except Exception:
-            return str(obj)
-    return obj
-
-
-# ============================================================================
-# 발주서 생성 안전 장치 - KeyError 방지
-# ============================================================================
-
-def safe_get(obj, key, default=None):
-    """
-    안전한 딕셔너리 접근 (단일 키)
-
-    예:
-        safe_get(item, 'quantity', 0) → item['quantity'] 또는 0 반환
-        safe_get(data, 'missing_key', 'N/A') → 'N/A' 반환
-    """
-    if not isinstance(obj, dict):
-        return default
-    return obj.get(key, default)
-
-
-def safe_get_nested(obj, keys, default=None):
-    """
-    안전한 중첩 딕셔너리 접근
-
-    예:
-        safe_get_nested(quotation_data, ['site_info', 'site_name'], 'Unknown')
-        → quotation_data['site_info']['site_name'] 또는 'Unknown' 반환
-    """
-    if not isinstance(obj, dict) or not isinstance(keys, list):
-        return default
-
-    current = obj
-    for key in keys:
-        if not isinstance(current, dict):
-            return default
-        current = current.get(key)
-        if current is None:
-            return default
-
-    return current
-
-
-def validate_dict_keys(obj, required_keys):
-    """
-    딕셔너리의 필수 키 존재 여부 검증
-
-    예:
-        validate_dict_keys(item, ['quantity', 'material_name'])
-        → 모든 키가 존재하고 None이 아니면 True, 아니면 False
-    """
-    if not isinstance(obj, dict):
-        return False
-
-    for key in required_keys:
-        if key not in obj or obj[key] is None:
-            return False
-
-    return True
-
-
-# ============================================================================
-
-def _phase3_record_quotation(tenant_id: str, quotation_data: dict):
-    try:
-        db = _get_phase3_db()
-        items = (quotation_data or {}).get('items') or []
-        site = (quotation_data or {}).get('site_info') or {}
-        project_id = site.get('project_id')
-        try:
-            total = float(quotation_data.get('total_amount')) if quotation_data.get('total_amount') is not None else None
-        except Exception:
-            total = None
-        if total is None:
-            try:
-                total = float(sum(float((i.get('unit_price') or 0)) * float((i.get('quantity') or 0)) for i in items))
-            except Exception:
-                total = 0.0
-        qid = f"Q-{int(time.time())}-{random.randint(100,999)}"
-        db.add_quotation(qid, tenant_id, customer_id=None, project_id=project_id, total_amount=total)
-        rows = []
-        for it in items:
-            name = (it.get('model_name') or it.get('material_name') or '').strip()
-            spec = (it.get('specification') or it.get('standard') or '').strip()
-            qty = float(it.get('quantity') or 0)
-            price = float(it.get('unit_price') or 0)
-            db.add_quotation_item(qid, name, spec=spec, quantity=qty, unit_price=price)
-            rows.append({'품목': name, '규격': spec, '수량': qty, '단가': price, '금액': qty*price, '비고': (it.get('notes') or '')})
-        # Save Excel-like snapshot for quotations
-        try:
-            payload = {
-                'header': {
-                    '프로젝트': (site.get('site_name') if isinstance(site, dict) else None),
-                    '견적ID': qid,
-                    '총액': total,
-                },
-                'items': rows,
-            }
-            db.add_bom_snapshot(tenant_id, 'quotation', qid, int(time.time()), _p3_jsonable(payload))
-        except Exception:
-            pass
-    except Exception as e:
-        try:
-            st.session_state.setdefault('debug_messages', []).append(f"[Phase3] quotation record failed: {e}")
-        except Exception:
-            pass
-
-
-def _phase3_record_po(tenant_id: str, category: str, supplier_name: str, items: list, project_id: str = None):
-    try:
-        db = _get_phase3_db()
-        abbr = (category or '')[:3].upper() if category else 'GEN'
-        po_id = f"PO-{int(time.time())}-{abbr}"
-        db.add_purchase_order(po_id, tenant_id, vendor_id=(supplier_name or None), project_id=project_id, due_date=None, quotation_ref=None)
-        rows = []
-        for it in (items or []):
-            name = (it.get('material_name') or '').strip()
-            spec = (it.get('standard') or '').strip()
-            item_name = (f"{name} {spec}").strip()
-            qty = float(it.get('quantity') or 0)
-            price = float(it.get('unit_price') or 0)
-            db.add_po_item(po_id, item_name, material_id=None, quantity=qty, unit_price=price)
-            rows.append({'품목': name, '규격': spec, '단위': (it.get('unit') or 'EA'), '수량': qty, '단가': price, '금액': qty*price, '비고': (it.get('notes') or ''), '모델참조': (it.get('model_reference') or '')})
-        # Save Excel-like snapshot for POs
-        try:
-            payload = {
-                'header': {
-                    '발주ID': po_id,
-                    '카테고리': category,
-                    '공급업체': supplier_name,
-                    '프로젝트ID': project_id,
-                },
-                'items': rows,
-            }
-            db.add_bom_snapshot(tenant_id, 'po', po_id, int(time.time()), _p3_jsonable(payload))
-        except Exception:
-            pass
-    except Exception as e:
-        try:
-            st.session_state.setdefault('debug_messages', []).append(f"[Phase3] PO record failed: {e}")
-        except Exception:
-            pass
-
-
-def _phase3_record_bom_and_execution(tenant_id: str, material_items: list, quotation_data: dict):
-    try:
-        db = _get_phase3_db()
-        site = (quotation_data or {}).get('site_info') or {}
-        linked_id = site.get('project_id') or site.get('site_name') or 'unknown'
-        # Map to Excel-like columns
-        rows = []
-        for m in (material_items or []):
-            if m.get('is_header'):
-                continue
-            qty = float(m.get('quantity') or 0)
-            price = float(m.get('unit_price') or 0)
-            rows.append({
-                '품목': (m.get('material_name') or m.get('model_name') or ''),
-                '규격': (m.get('standard') or m.get('specification') or ''),
-                '수량': qty,
-                '단위': (m.get('unit') or 'EA'),
-                '단가': price,
-                '금액': qty * price,
-                '비고': (m.get('notes') or ''),
-                '모델참조': (m.get('model_reference') or m.get('model_name') or ''),
-            })
-        payload_bom = {'items': rows}
-        db.add_bom_snapshot(tenant_id, 'project', str(linked_id), int(time.time()), _p3_jsonable(payload_bom))
-        # Also record execution snapshot with common header and empty items (editable in Demo)
-        try:
-            _items_q = (quotation_data or {}).get('items') or []
-            _total = (quotation_data or {}).get('total_amount')
-            if _total is None:
-                try:
-                    _total = float(sum(float(i.get('unit_price') or 0) * float(i.get('quantity') or 0) for i in _items_q))
-                except Exception:
-                    _total = 0.0
-            payload_exec = {
-                'header': { '계약금액(부가세포함)': _total },
-                'items': [],
-                'type': 'execution'
-            }
-            db.add_bom_snapshot(tenant_id, 'execution', str(linked_id), int(time.time()), _p3_jsonable(payload_exec))
-        except Exception:
-            pass
-    except Exception as e:
-        try:
-            st.session_state.setdefault('debug_messages', []).append(f"[Phase3] BOM/Execution snapshot failed: {e}")
-        except Exception:
-            pass
-
-
-# ============================================================================
-# P0 생성 버튼 전환용 신규 헬퍼 함수들
-# ============================================================================
-
-def _create_quotation_and_buffer(app_instance, quotation_data, contract_type):
-    """
-    견적서를 생성하고 Excel 버퍼 + 세션 상태에 저장.
-    반환: (success: bool, excel_buffer: BytesIO or None, error_msg: str or None)
-    """
-    try:
-        quotation_data = dict(quotation_data)  # 사본
-        quotation_data['contract_type'] = contract_type
-
-        # Excel 생성
-        excel_buffer = app_instance.create_template_quotation(quotation_data)
-        if not excel_buffer:
-            return False, None, "견적서 Excel 생성 실패"
-
-        # 세션에 버퍼 저장
-        st.session_state['quotation_buffer'] = excel_buffer
-        st.session_state['quotation_data'] = quotation_data
-
-        return True, excel_buffer, None
-
-    except Exception as e:
-        return False, None, f"견적서 생성 중 오류: {str(e)}"
-
-
-def _save_quotation_to_db(tenant_id, quotation_data):
-    """견적서를 데이터베이스에 저장"""
-    try:
-        _phase3_record_quotation(tenant_id, quotation_data)
-        return True, None
-    except Exception as e:
-        return False, f"견적서 DB 저장 실패: {str(e)}"
-
-
-def _create_po_and_buffer(app_instance, quotation_data, purchase_items, delivery_location, supplier_info, delivery_date, category):
-    """
-    발주서를 생성하고 Excel 버퍼 + 세션 상태에 저장.
-    반환: (success: bool, excel_buffer: BytesIO or None, error_msg: str or None)
-    """
-    try:
-        # Excel 생성
-        excel_buffer = app_instance._create_single_purchase_order_by_category(
-            quotation_data,
-            purchase_items,
-            delivery_location,
-            supplier_info,
-            delivery_date
-        )
-        if not excel_buffer:
-            return False, None, "발주서 Excel 생성 실패"
-
-        # 세션에 버퍼 저장 (다중 발주서용 dict)
-        if 'po_buffers' not in st.session_state:
-            st.session_state['po_buffers'] = {}
-        po_key = f"{category}_{supplier_info.get('company_name', 'unknown')}"
-        st.session_state['po_buffers'][po_key] = {
-            'buffer': excel_buffer,
-            'category': category,
-            'supplier_name': supplier_info.get('company_name'),
-            'items': purchase_items
-        }
-
-        return True, excel_buffer, None
-
-    except Exception as e:
-        return False, None, f"발주서 생성 중 오류: {str(e)}"
-
-
-def _save_po_to_db(tenant_id, category, supplier_name, items, project_id=None):
-    """발주서를 데이터베이스에 저장"""
-    try:
-        _phase3_record_po(tenant_id, category, supplier_name, items, project_id)
-        return True, None
-    except Exception as e:
-        return False, f"발주서 DB 저장 실패: {str(e)}"
-
-
-def _create_bom_and_execution_buffer(app_instance, quotation_data, material_items, delivery_date=None):
-    """
-    BOM과 실행내역서를 생성하고 Excel 버퍼 + 세션 상태에 저장.
-    반환: (success: bool, excel_buffer: BytesIO or None, error_msg: str or None)
-    """
-    try:
-        # Excel 생성
-        excel_buffer, _ = app_instance.create_material_execution_report(quotation_data, delivery_date)
-        if not excel_buffer:
-            return False, None, "자재·실행내역서 Excel 생성 실패"
-
-        # 세션에 버퍼 저장
-        st.session_state['bom_execution_buffer'] = excel_buffer
-        st.session_state['bom_execution_data'] = {
-            'quotation_data': quotation_data,
-            'material_items': material_items,
-            'delivery_date': delivery_date
-        }
-
-        return True, excel_buffer, None
-
-    except Exception as e:
-        return False, None, f"자재·실행내역서 생성 중 오류: {str(e)}"
-
-
-def _save_bom_and_execution_to_db(tenant_id, material_items, quotation_data):
-    """BOM과 실행내역서를 데이터베이스에 저장"""
-    try:
-        _phase3_record_bom_and_execution(tenant_id, material_items, quotation_data)
-        return True, None
-    except Exception as e:
-        return False, f"BOM·실행내역서 DB 저장 실패: {str(e)}"
-
-
-# ============================================================================
-# P0-2: 아이템 정규화 공통 함수
-# ============================================================================
-
-def normalize_item(item: dict, skip_header=True) -> dict:
-    """
-    다양한 출처의 아이템을 정규 컬럼으로 정규화.
-
-    입력: {model_name, material_name, standard/spec/specification, unit, quantity, unit_price, ...}
-    출력: {material_name, standard, unit, quantity, unit_price, model_reference, notes, ...}
-
-    Args:
-        item: 입력 아이템 dict
-        skip_header: True면 is_header=True 아이템은 그대로 반환 (필터링 안 함)
-
-    Returns:
-        정규화된 dict
-    """
-    if not isinstance(item, dict):
-        return {}
-
-    # Header 아이템이면 그대로 반환
-    if skip_header and item.get('is_header'):
-        return item
-
-    # 필수 필드 정규화
-    normalized = {
-        'material_name': (item.get('material_name') or item.get('품목') or '').strip(),
-        'standard': (item.get('standard') or item.get('spec') or item.get('specification') or item.get('규격') or '').strip(),
-        'unit': normalize_unit(item.get('unit') or item.get('단위') or 'EA'),
-        'quantity': float(item.get('quantity') or item.get('수량') or 0),
-        'unit_price': float(item.get('unit_price') or item.get('단가') or 0),
-    }
-
-    # 선택적 필드
-    normalized['model_reference'] = (item.get('model_reference') or item.get('model_name') or item.get('모델참조') or '').strip()
-    normalized['notes'] = (item.get('notes') or item.get('비고') or item.get('remarks') or '').strip()
-    normalized['category'] = (item.get('category') or item.get('분류') or 'GENERAL').strip()
-
-    # 추가 메타데이터 보존
-    if item.get('is_header'):
-        normalized['is_header'] = True
-    if item.get('model_name'):
-        normalized['model_name'] = item.get('model_name')
-    if item.get('delivery_location'):
-        normalized['delivery_location'] = item.get('delivery_location')
-    if item.get('vehicle_number'):
-        normalized['vehicle_number'] = item.get('vehicle_number')
-
-    return normalized
-
-
-def normalize_items_list(items: list, skip_header=True) -> list:
-    """
-    여러 아이템을 한 번에 정규화.
-
-    Args:
-        items: 아이템 list
-        skip_header: True면 header 아이템도 보존
-
-    Returns:
-        정규화된 list
-    """
-    if not isinstance(items, list):
-        return []
-    return [normalize_item(item, skip_header) for item in items]
-
-
-def get_item_required_fields(item: dict) -> dict:
-    """
-    아이템에서 필수 필드만 추출 (DB 저장용).
-
-    Returns: {material_name, standard, unit, quantity, unit_price}
-    """
-    normalized = normalize_item(item)
-    return {
-        'material_name': normalized.get('material_name', ''),
-        'standard': normalized.get('standard', ''),
-        'unit': normalized.get('unit', 'EA'),
-        'quantity': normalized.get('quantity', 0),
-        'unit_price': normalized.get('unit_price', 0),
-    }
-
-
-# ============================================================================
-# P0-5: 총 길이 → 경간 수 자동 계산 (모델별 폭 기반)
-# ============================================================================
-
-def calculate_span_count_from_total_length(total_length_m: float, model_standard: str, fallback_width_m: float = 2.0) -> int:
-    """
-    총 길이(m)와 모델 폭(model_standard에서 추출)으로 경간 수 자동 계산.
-
-    Args:
-        total_length_m: 총 길이 (미터, 예: 100)
-        model_standard: 모델 규격 (예: "W2000", "2000", "폭2000mm")
-        fallback_width_m: 폭 추출 실패 시 기본값 (기본: 2.0m)
-
-    Returns:
-        계산된 경간 수 (int)
-
-    Examples:
-        >>> calculate_span_count_from_total_length(100, "W2000")
-        50  # 100m ÷ 2m = 50경간
-
-        >>> calculate_span_count_from_total_length(100, "2500")
-        40  # 100m ÷ 2.5m = 40경간
-    """
-    try:
-        total_length = float(total_length_m)
-        if total_length <= 0:
-            return 1
-
-        # parse_width_m_from_standard 함수 사용
-        width_m = parse_width_m_from_standard(model_standard, fallback_width_m)
-        if width_m <= 0:
-            width_m = fallback_width_m
-
-        # 경간 수 계산: 총 길이 ÷ 폭
-        span_count = int(round(total_length / width_m))
-        return max(1, span_count)  # 최소 1경간
-
-    except Exception as e:
-        # 계산 실패 시 1경간 반환
-        print(f"[WARNING] 경간 계산 실패: {e}")
-        return 1
-
-
 # 테넌트 설정 - URL 파라미터 또는 쿼리 파라미터에서 가져오기
 def get_tenant_from_params():
     """URL 파라미터에서 테넌트 ID 가져오기"""
@@ -507,11 +23,11 @@ def get_tenant_from_params():
         query_params = st.query_params
         if 'tenant' in query_params:
             tenant = query_params['tenant']
-            if tenant in ['dooho', 'kukje', 'demo']:
+            if tenant in ['dooho', 'kukje']:
                 return tenant
     except:
         pass
-
+    
     # 기본값 또는 세션 상태에서 가져오기
     return st.session_state.get('current_tenant', 'dooho')
 
@@ -667,10 +183,6 @@ class UnifiedQuotationSystem:
             'kukje': {
                 'name': '국제',
                 'display_name': '국제'
-            },
-            'demo': {
-                'name': 'Aegis-Demo',
-                'display_name': 'Aegis-Demo'
             }
         }
         
@@ -695,16 +207,11 @@ class UnifiedQuotationSystem:
             sys.path.insert(0, str(project_root))
 
         from supabase import create_client
-        import os
         from app.config_supabase import SUPABASE_URL, SUPABASE_KEY
         from utils.ptop_engine import PtopEngine
 
         try:
-            # 환경변수에서 Supabase 설정 읽기 (demo 테넌트용 동적 설정)
-            supabase_url = os.getenv('SUPABASE_URL') or SUPABASE_URL
-            supabase_key = os.getenv('SUPABASE_KEY') or SUPABASE_KEY
-
-            supabase = create_client(supabase_url, supabase_key)
+            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
             self.engine = PtopEngine(supabase, tenant_id=self.tenant_id)
             print(f"[INFO] PtopEngine 초기화 성공 (tenant: {self.tenant_id})")
         except Exception as e:
@@ -718,7 +225,6 @@ class UnifiedQuotationSystem:
         import re
         norm = [re.sub(r'[^0-9A-Za-z]+', '_', str(p)) for p in parts if p is not None]
         return f"v091_{self.tenant_id}_{scope}_" + "_".join(norm)
-
 
     @st.cache_data
     def load_data(_self):
@@ -873,13 +379,9 @@ class UnifiedQuotationSystem:
 
         pricing_df = data.get('pricing')
         if pricing_df is None or len(pricing_df) == 0:
-            if st.session_state.get("_DBG", False):
-                st.warning("[DEBUG] pricing_df is empty or missing")
             return None
 
         if '모델명' not in pricing_df.columns:
-            if st.session_state.get("_DBG", False):
-                st.warning(f"[DEBUG] pricing_df columns: {list(pricing_df.columns)} — '모델명' 컬럼 없음")
             return None
 
         model_clean = str(model_name).strip()
@@ -888,9 +390,6 @@ class UnifiedQuotationSystem:
 
         if not exact_match.empty:
             return exact_match.iloc[0]
-
-        if st.session_state.get("_DBG", False):
-            st.warning(f"[DEBUG] price_miss(find_model_price): model={model_clean} | available_cols={list(pricing_df.columns)} | rows={len(pricing_df)}")
 
         return None
 
@@ -962,11 +461,6 @@ class UnifiedQuotationSystem:
         data = self.load_data()
         purchase_items = []
 
-        # ===== 안전한 데이터 접근 시작 =====
-        # quotation_data 기본 검증
-        if not isinstance(quotation_data, dict):
-            return purchase_items
-
         plan = {}
         try:
             plan = quotation_data.get('site_info', {}).get('model_span_plan', {}) or {}
@@ -982,81 +476,56 @@ class UnifiedQuotationSystem:
                 for _, r in models_df.iterrows():
                     model_cat_map[str(r[name_col])] = str(r[cat_col])
 
-        # 안전한 중첩 접근: site_info.total_span_count
-        total_span_count = int(safe_get_nested(quotation_data, ['site_info', 'total_span_count'], 1))
+        total_span_count = int(quotation_data['site_info'].get('total_span_count', 1))
 
-        # 안전한 items 접근
-        items = safe_get(quotation_data, 'items', [])
-        if not items:
-            return purchase_items
+        for item in quotation_data['items']:
+            model_info = data['models'][data['models']['model_name'] == item['model_name']]
 
-        for item in items:
-            # 필수 필드 검증: model_name, quantity
-            if not validate_dict_keys(item, ['model_name', 'quantity']):
-                continue  # 불완전한 항목은 건너뜀
+            if not model_info.empty:
+                model_id = model_info.iloc[0]['model_id']
+                model_bom = self.engine.get_bom(model_id)
 
-            try:
-                model_name = item['model_name']
-                item_quantity = float(item['quantity'])
+                for _, bom_item in model_bom.iterrows():
+                    model_name = item['model_name']
+                    multiplier = total_span_count
+                    if model_name in plan:
+                        multiplier = int(plan[model_name].get('span_count', multiplier))
+                    model_cat = model_cat_map.get(model_name, '')
+                    if '차양' in str(model_cat):
+                        multiplier = 1
 
-                model_info = data['models'][data['models']['model_name'] == model_name]
-
-                if not model_info.empty:
-                    model_id = model_info.iloc[0]['model_id']
-                    model_bom = self.engine.get_bom(model_id)
-
-                    # BOM 데이터 유효성 검증 (Empty DataFrame 체크)
-                    if model_bom is None or model_bom.empty:
-                        print(f"[WARNING] BOM not found for model: {model_name} (model_id: {model_id})")
-                        continue  # 다음 item으로 진행
-
-                    for _, bom_item in model_bom.iterrows():
-                        multiplier = total_span_count
-                        if model_name in plan:
-                            multiplier = int(plan[model_name].get('span_count', multiplier))
-                        model_cat = model_cat_map.get(model_name, '')
-                        if '차양' in str(model_cat):
-                            multiplier = 1
-
-                        per_span_qty = float(bom_item['quantity'])
-                        required_quantity = item_quantity * per_span_qty * multiplier
-
-                        if 'PIPE' in str(bom_item['category']).upper():
-                            required_quantity = self._calculate_pipe_count(
-                                required_quantity,
-                                bom_item['standard'],
-                                data
-                            )
-                            unit = 'EA'
-                        else:
-                            unit = bom_item['unit']
-
-                        existing_item = None
-                        for purchase_item in purchase_items:
-                            if (purchase_item['material_name'] == bom_item['material_name'] and
-                                purchase_item['standard'] == bom_item['standard']):
-                                existing_item = purchase_item
-                                break
-
-                        if existing_item:
-                            existing_item['quantity'] += required_quantity
-                        else:
-                            purchase_items.append({
-                                'material_name': bom_item['material_name'],
-                                'standard': bom_item['standard'],
-                                'unit': unit,
-                                'quantity': required_quantity,
-                                'category': bom_item['category'],
-                                'model_reference': model_name
-                            })
-            except Exception as e:
-                # 개별 항목 처리 실패는 로그하고 계속
-                import traceback
-                print(f"[ERROR] Item processing failed for model: {item.get('model_name', 'N/A')}")
-                print(f"[ERROR] Exception: {e}")
-                print(f"[ERROR] Traceback: {traceback.format_exc()}")
-                continue
-
+                    per_span_qty = float(bom_item['quantity'])
+                    required_quantity = item['quantity'] * per_span_qty * multiplier
+                    
+                    if 'PIPE' in str(bom_item['category']).upper():
+                        required_quantity = self._calculate_pipe_count(
+                            required_quantity, 
+                            bom_item['standard'], 
+                            data
+                        )
+                        unit = 'EA'
+                    else:
+                        unit = bom_item['unit']
+                    
+                    existing_item = None
+                    for purchase_item in purchase_items:
+                        if (purchase_item['material_name'] == bom_item['material_name'] and
+                            purchase_item['standard'] == bom_item['standard']):
+                            existing_item = purchase_item
+                            break
+                    
+                    if existing_item:
+                        existing_item['quantity'] += required_quantity
+                    else:
+                        purchase_items.append({
+                            'material_name': bom_item['material_name'],
+                            'standard': bom_item['standard'],
+                            'unit': unit,
+                            'quantity': required_quantity,
+                            'category': bom_item['category'],
+                            'model_reference': item['model_name']
+                        })
+        
         return purchase_items
 
     def create_material_execution_report(self, quotation_data, delivery_date=None):
@@ -1313,13 +782,8 @@ class UnifiedQuotationSystem:
                         return self._create_material_result_from_sub(material_row)
 
                 if '규격' in sub_materials.columns:
-                    # 표준 정규화 (x → *)
-                    normalized_search = self._normalize_special_chars(str(standard))
-                    # DB 값도 정규화하여 비교
                     standard_match = sub_materials[
-                        sub_materials['규격'].astype(str).apply(
-                            lambda x: normalized_search in self._normalize_special_chars(x)
-                        )
+                        sub_materials['규격'].astype(str).str.contains(str(standard), na=False, case=False)
                     ]
                     if not standard_match.empty:
                         material_row = standard_match.iloc[0]
@@ -1344,10 +808,9 @@ class UnifiedQuotationSystem:
     def _compare_with_reversed_dimensions(self, bom_spec, main_spec):
         """치수 순서를 바꿔서 비교"""
         import re
-
-        # x 또는 * 모두 매칭하도록 정규표현식 수정
-        bom_match = re.match(r'(\d+)[x*](\d+)[x*](.+)', bom_spec, re.IGNORECASE)
-        main_match = re.match(r'(\d+)[x*](\d+)[x*](.+)', main_spec, re.IGNORECASE)
+        
+        bom_match = re.match(r'(\d+)\*(\d+)\*(.+)', bom_spec)
+        main_match = re.match(r'(\d+)\*(\d+)\*(.+)', main_spec)
         
         if bom_match and main_match:
             bom_dim1, bom_dim2, bom_thickness = bom_match.groups()
@@ -1378,10 +841,7 @@ class UnifiedQuotationSystem:
 
     def _normalize_special_chars(self, spec):
         """특수문자 정규화"""
-        # x, X 를 * 로 정규화 (DB 표준 형식)
-        normalized = spec.replace('x', '*').replace('X', '*')
-        # 지름 기호 정규화
-        normalized = normalized.replace('∅', 'Ø').replace('Φ', 'Ø').replace('φ', 'Ø')
+        normalized = spec.replace('∅', 'Ø').replace('Φ', 'Ø').replace('φ', 'Ø')
         normalized = normalized.upper()
         return normalized
     
@@ -1460,13 +920,7 @@ class UnifiedQuotationSystem:
 
     def _get_specification_with_length_fixed(self, material_name, standard, data):
         """규격에 파이프 길이 정보 추가"""
-        bom_data = data.get('bom', pd.DataFrame())
-
-        # BOM 데이터 유효성 검증
-        if bom_data.empty or 'material_name' not in bom_data.columns:
-            # BOM 데이터가 없거나 컬럼이 없으면 표준만 반환
-            return standard
-
+        bom_data = data['bom']
         material_bom = bom_data[bom_data['material_name'] == material_name]
         
         is_pipe = False
@@ -2054,58 +1508,15 @@ class UnifiedQuotationSystem:
                     edits = self._render_inline_bom_editor(material_items)
 
                     filename = f"자재 및 실행내역서_{site_name}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-
-                    # 프로젝트 폴더 자동 생성 및 저장
-                    def save_to_project_folder():
-                        try:
-                            # .env에서 프로젝트 폴더 경로 읽기
-                            project_folder_path = os.getenv('PROJECT_FOLDER_PATH', 'downloads')
-
-                            # 프로젝트명으로 폴더 생성
-                            project_folder = Path(project_folder_path) / site_name
-                            project_folder.mkdir(parents=True, exist_ok=True)
-
-                            # 파일 저장
-                            file_path = project_folder / filename
-                            with open(file_path, 'wb') as f:
-                                f.write(excel_buffer.getvalue())
-
-                            st.success(f"✅ 파일이 저장되었습니다: {file_path}")
-                        except Exception as e:
-                            st.error(f"❌ 파일 저장 중 오류: {str(e)}")
-
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.download_button(
-                            label="📥 자재 및 실행내역서 다운로드",
-                            data=excel_buffer.getvalue(),
-                            file_name=filename,
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            type="primary",
-                            use_container_width=True,
-                            key=self._ukey("download_exec_report", filename),
-                            on_click=_phase3_record_bom_and_execution,
-                            args=(self.tenant_id, material_items, st.session_state.get('last_material_data'))
-                        )
-
-                    with col2:
-                        if st.button("💾 문서 보관", type="secondary", use_container_width=True, key=self._ukey("save_material_archive")):
-                            success, msg = save_generated_document_to_archive(
-                                self.engine.db,
-                                self.tenant_id,
-                                site_name,
-                                "내역서",
-                                excel_buffer,
-                                username=st.session_state.get('user_id', self.tenant_id)
-                            )
-                            if success:
-                                st.success(msg)
-                            else:
-                                st.error(msg)
-
-                    # 프로젝트 폴더에 저장 버튼
-                    if st.button("💾 프로젝트 폴더에 저장", key=self._ukey("save_to_folder", filename)):
-                        save_to_project_folder()
+                    st.download_button(
+                        label="📥 자재 및 실행내역서 다운로드",
+                        data=excel_buffer.getvalue(),
+                        file_name=filename,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                        use_container_width=True,
+                        key=self._ukey("download_exec_report", filename)
+                    )
 
                     st.markdown("---")
                     colx1, colx2 = st.columns([3,2])
@@ -2241,8 +1652,6 @@ class UnifiedQuotationSystem:
                 cat = str(row.get("category","")).strip()
 
                 if cat != "MANUAL":
-                    if st.session_state.get("_DBG", False):
-                        st.info(f"[DEBUG] 기존 BOM 데이터 건너뜀: {mat} (category: {cat})")
                     continue
 
                 mask = (
@@ -2393,17 +1802,14 @@ class UnifiedQuotationSystem:
     def create_purchase_order_interface(self):
         """발주서 생성 인터페이스"""
         st.header("📋 발주서 자동생성")
-
+        
         if 'last_material_data' not in st.session_state:
             st.warning("먼저 자재발실행내역서를 생성해주세요. 자재 데이터를 기반으로 발주서가 생성됩니다.")
             return
-
+        
         quotation_data = st.session_state.last_material_data
-
-        # 안전한 데이터 접근
-        site_name = safe_get_nested(quotation_data, ['site_info', 'site_name'], 'Unknown')
-        item_count = len(safe_get(quotation_data, 'items', []))
-        st.info(f"현장: {site_name} | 자재 항목: {item_count}개")
+        
+        st.info(f"현장: {quotation_data['site_info']['site_name']} | 자재 항목: {len(quotation_data['items'])}개")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -2499,179 +1905,113 @@ class UnifiedQuotationSystem:
                     
                     st.markdown("---")
 
-                    # 생성된 발주서 표시 (session state에서 읽음)
-                    po_key = f"{category}_{supplier_name}"
-                    if st.session_state.get(f"po_generated_{po_key}", False):
-                        excel_buffer = st.session_state.get(f"po_excel_buffer_{po_key}")
-                        quotation_data_stored = st.session_state.get(f"po_quotation_data_{po_key}")
-                        items_stored = st.session_state.get(f"po_items_{po_key}")
-
-                        if excel_buffer and quotation_data_stored:
-                            site_name = quotation_data_stored['site_info']['site_name']
-                            filename = f"발주서_{supplier_name}_{category}_{site_name}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-
-                            st.success(f"✅ {category} → {supplier_name} 발주서 생성 완료!")
-
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric("카테고리", category)
-                            with col2:
-                                st.metric("자재 종류", f"{len(items_stored) if items_stored else 0}개")
-                            with col3:
-                                st.metric("공급업체", supplier_name)
-
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.download_button(
-                                    label=f"📥 {supplier_name} ({category}) 발주서 다운로드",
-                                    data=excel_buffer.getvalue(),
-                                    file_name=filename,
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    key=f"download_po_{category}_{supplier_name}",
-                                    type="primary",
-                                    use_container_width=True,
-                                    on_click=_phase3_record_po,
-                                    args=(self.tenant_id, category, supplier_name, items_stored, ((st.session_state.get('last_material_data') or {}).get('site_info') or {}).get('project_id'))
-                                )
-
-                            with col2:
-                                if st.button("💾 문서 보관", type="secondary", use_container_width=True, key=f"save_po_archive_{category}_{supplier_name}"):
-                                    success, msg = save_generated_document_to_archive(
-                                        self.engine.db,
-                                        self.tenant_id,
-                                        site_name,
-                                        "발주서",
-                                        excel_buffer,
-                                        username=st.session_state.get('user_id', self.tenant_id)
-                                    )
-                                    if success:
-                                        st.success(msg)
-                                    else:
-                                        st.error(msg)
-
-                            with st.expander(f"📋 {supplier_name} 발주 내역 상세", expanded=False):
-                                if items_stored:
-                                    df_order = pd.DataFrame([
-                                        {
-                                            '자재명': item['material_name'],
-                                            '규격': item['standard'],
-                                            '수량': f"{item['quantity']:,.1f}",
-                                            '단위': item['unit'],
-                                            '모델참조': item.get('model_reference', '')
-                                        }
-                                        for item in items_stored
-                                    ])
-                                    st.dataframe(df_order, use_container_width=True)
-
-    def _create_category_purchase_order(self, category, items, supplier_name,
+    def _create_category_purchase_order(self, category, items, supplier_name, 
                                     delivery_location, delivery_date, quotation_data):
         """카테고리별 발주서 생성"""
         try:
             with st.spinner(f"{category} → {supplier_name} 발주서 생성 중..."):
                 excel_buffer = self._create_single_purchase_order_by_category(
-                    quotation_data, items, delivery_location,
+                    quotation_data, items, delivery_location, 
                     {'company_name': supplier_name}, delivery_date
                 )
-
+                
                 if excel_buffer:
-                    # Session state에 버퍼 저장 (버튼 클릭 후에도 유지)
-                    po_key = f"{category}_{supplier_name}"
-                    st.session_state[f"po_excel_buffer_{po_key}"] = excel_buffer
-                    st.session_state[f"po_category_{po_key}"] = category
-                    st.session_state[f"po_supplier_{po_key}"] = supplier_name
-                    st.session_state[f"po_quotation_data_{po_key}"] = quotation_data
-                    st.session_state[f"po_items_{po_key}"] = items
-                    st.session_state[f"po_generated_{po_key}"] = True
-
+                    filename = f"발주서_{supplier_name}_{category}_{quotation_data['site_info']['site_name']}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+                    
                     st.success(f"✅ {category} → {supplier_name} 발주서 생성 완료!")
-                    st.rerun()
-
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("카테고리", category)
+                    with col2:
+                        st.metric("자재 종류", f"{len(items)}개")
+                    with col3:
+                        st.metric("공급업체", supplier_name)
+                    
+                    st.download_button(
+                        label=f"📥 {supplier_name} ({category}) 발주서 다운로드",
+                        data=excel_buffer.getvalue(),
+                        file_name=filename,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"download_{category}_{supplier_name}_{datetime.now().strftime('%H%M%S')}",
+                        type="primary",
+                        use_container_width=True
+                    )
+                    
+                    with st.expander(f"📋 {supplier_name} 발주 내역 상세", expanded=False):
+                        df_order = pd.DataFrame([
+                            {
+                                '자재명': item['material_name'],
+                                '규격': item['standard'],
+                                '수량': f"{item['quantity']:,.1f}",
+                                '단위': item['unit'],
+                                '모델참조': item['model_reference']
+                            }
+                            for item in items
+                        ])
+                        st.dataframe(df_order, use_container_width=True)
+                else:
+                    st.error(f"{category} 발주서 생성에 실패했습니다.")
+                    
         except Exception as e:
-            st.error(f"발주서 생성 중 오류: {str(e)}")
+            st.error(f"발주서 생성 오류: {e}")
 
-    def _create_single_purchase_order_by_category(self, quotation_data, purchase_items,
+    def _create_single_purchase_order_by_category(self, quotation_data, purchase_items, 
                                                 delivery_location, supplier_info, delivery_date):
         """카테고리별 단일 발주서 생성"""
         try:
             template_path = resolve_template_path('발주서템플릿_v2.0_20250919.xlsx')
             workbook = load_workbook(template_path)
             sheet = workbook['발주서']
-
+            
             today = datetime.now()
             sheet['F4'] = today.strftime('%Y년 %m월 %d일')
-
-            # 안전한 supplier_info 접근
-            company_name = safe_get(supplier_info, 'company_name', '미정')
-            sheet['B6'] = company_name
-
-            # 안전한 quotation_data 접근
-            site_name = safe_get_nested(quotation_data, ['site_info', 'site_name'], 'Unknown')
+            sheet['B6'] = supplier_info['company_name']
+            
+            site_name = quotation_data['site_info']['site_name']
             start_row = 11
-
+            
             data = self.load_data()
-
-            # purchase_items 검증
-            if not isinstance(purchase_items, list):
-                st.error("발주 항목 데이터가 유효하지 않습니다.")
-                return None
-
+            
             for idx, purchase_item in enumerate(purchase_items):
-                # 각 항목의 필수 필드 검증
-                if not validate_dict_keys(purchase_item, ['material_name', 'standard', 'unit', 'quantity']):
-                    print(f"[WARNING] PO item {idx} missing required fields: {purchase_item}")
-                    continue  # 불완전한 항목은 건너뜀
-
-                try:
-                    row = start_row + idx
-
-                    specification = self._get_specification_with_length_fixed(
-                        purchase_item['material_name'],
-                        purchase_item['standard'],
-                        data
-                    )
-
-                    sheet[f'A{row}'] = idx + 1
-                    sheet[f'B{row}'] = purchase_item['material_name']
-                    sheet[f'C{row}'] = specification
-                    sheet[f'D{row}'] = purchase_item['unit']
-                    sheet[f'E{row}'] = purchase_item['quantity']
-                    sheet[f'F{row}'] = delivery_location
-                    sheet[f'G{row}'] = site_name
-                    sheet[f'H{row}'] = f"모델: {safe_get(purchase_item, 'model_reference', 'N/A')}"
-                except Exception as e:
-                    import traceback
-                    print(f"[ERROR] Row {row} write failed")
-                    print(f"[ERROR] purchase_item: {purchase_item}")
-                    print(f"[ERROR] Exception: {e}")
-                    print(f"[ERROR] Traceback: {traceback.format_exc()}")
-                    continue
-
+                row = start_row + idx
+                
+                specification = self._get_specification_with_length_fixed(
+                    purchase_item['material_name'], 
+                    purchase_item['standard'], 
+                    data
+                )
+                
+                sheet[f'A{row}'] = idx + 1
+                sheet[f'B{row}'] = purchase_item['material_name']
+                sheet[f'C{row}'] = specification
+                sheet[f'D{row}'] = purchase_item['unit']
+                sheet[f'E{row}'] = purchase_item['quantity']
+                sheet[f'F{row}'] = delivery_location
+                sheet[f'G{row}'] = site_name
+                sheet[f'H{row}'] = f"모델: {purchase_item['model_reference']}"
+            
             excel_buffer = io.BytesIO()
             workbook.save(excel_buffer)
             excel_buffer.seek(0)
-
+            
             return excel_buffer
-
+            
         except Exception as e:
             st.error(f"발주서 생성 오류: {e}")
-            import traceback
-            print(f"[ERROR] PO generation exception: {traceback.format_exc()}")
             return None
 
     def create_quotation_interface(self):
         """견적서 생성 인터페이스"""
         st.header("💰 견적서 자동생성")
-
+        
         if 'last_material_data' not in st.session_state:
             st.warning("먼저 자재 및 실행내역서를 생성해주세요. 해당 데이터를 기반으로 견적서가 생성됩니다.")
             return
-
+        
         quotation_data = st.session_state.last_material_data
-
-        # 안전한 데이터 접근
-        site_name = safe_get_nested(quotation_data, ['site_info', 'site_name'], 'Unknown')
-        item_count = len(safe_get(quotation_data, 'items', []))
-        st.info(f"현장: {site_name} | 견적 항목: {item_count}개")
+        
+        st.info(f"현장: {quotation_data['site_info']['site_name']} | 견적 항목: {len(quotation_data['items'])}개")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -2706,40 +2046,18 @@ class UnifiedQuotationSystem:
             st.dataframe(detail_df, use_container_width=True)
             
             excel_buffer = self.create_template_quotation(quotation_data)
-
+            
             if excel_buffer:
                 filename = f"{self.tenant_config[self.tenant_id]['display_name']}견적서_{quotation_data['site_info']['site_name']}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-
-                # 다운로드 버튼 (기존 기능)
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.download_button(
-                        label="📥 템플릿 견적서 다운로드",
-                        data=excel_buffer.getvalue(),
-                        file_name=filename,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        type="primary",
-                        use_container_width=True,
-                        on_click=_phase3_record_quotation,
-                        args=(self.tenant_id, quotation_data)
-                    )
-
-                # 문서 보관 버튼 (document_archive 저장)
-                with col2:
-                    if st.button("💾 문서 보관", type="secondary", use_container_width=True, key="save_quotation_archive"):
-                        project_name = quotation_data['site_info']['site_name']
-                        success, msg = save_generated_document_to_archive(
-                            self.engine.db,
-                            self.tenant_id,
-                            project_name,
-                            "견적서",
-                            excel_buffer,
-                            username=st.session_state.get('user_id', self.tenant_id)
-                        )
-                        if success:
-                            st.success(msg)
-                        else:
-                            st.error(msg)
+                
+                st.download_button(
+                    label="📥 템플릿 견적서 다운로드",
+                    data=excel_buffer.getvalue(),
+                    file_name=filename,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    use_container_width=True
+                )
             else:
                 st.error("견적서 생성에 실패했습니다.")
 
@@ -2959,43 +2277,18 @@ class UnifiedQuotationSystem:
                     )
 
                     if excel_buffer:
-                        # Session state에 버퍼 저장 (버튼 클릭 후에도 유지)
-                        st.session_state.ind_quote_excel_buffer = excel_buffer
-                        st.session_state.ind_quote_recipient = recipient
-                        st.session_state.ind_quote_generated = True
+                        filename = f"견적서_{recipient}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+
+                        st.download_button(
+                            label="📥 견적서 다운로드",
+                            data=excel_buffer.getvalue(),
+                            file_name=filename,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            type="primary",
+                            use_container_width=True
+                        )
                     else:
                         st.error("견적서 생성에 실패했습니다.")
-
-            # 생성된 견적서 표시 (session state에서 읽음)
-            if st.session_state.get("ind_quote_generated", False):
-                filename = f"견적서_{st.session_state.ind_quote_recipient}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-                excel_buffer = st.session_state.ind_quote_excel_buffer
-
-                col_dl, col_save = st.columns(2)
-                with col_dl:
-                    st.download_button(
-                        label="📥 견적서 다운로드",
-                        data=excel_buffer.getvalue(),
-                        file_name=filename,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        type="primary",
-                        use_container_width=True
-                    )
-
-                with col_save:
-                    if st.button("💾 문서 보관", type="secondary", use_container_width=True, key="save_independent_quote_archive"):
-                        success, msg = save_generated_document_to_archive(
-                            self.engine.db,
-                            self.tenant_id,
-                            st.session_state.ind_quote_recipient,
-                            "견적서",
-                            excel_buffer,
-                            username=st.session_state.get('user_id', self.tenant_id)
-                        )
-                        if success:
-                            st.success(msg)
-                        else:
-                            st.error(msg)
         else:
             st.info("👆 위에서 모델을 검색하고 견적에 추가해주세요.")
 
@@ -3125,33 +2418,28 @@ class EnhancedModelSearch:
     def _search_by_dimensions(self, query):
         """치수 기반 검색"""
         results = []
-
+        
         patterns = [
             r'w(\d+)', r'width(\d+)', r'폭(\d+)',
             r'h(\d+)', r'height(\d+)', r'높이(\d+)',
             r'(\d+)w', r'(\d+)h'
         ]
-
-        # 쿼리 정규화: x 를 * 로 변환
-        normalized_query = self._normalize_search_string(query)
-        query_lower = normalized_query.lower()
+        
+        query_lower = query.lower()
         extracted_numbers = []
-
+        
         for pattern in patterns:
             matches = re.findall(pattern, query_lower)
             extracted_numbers.extend(matches)
-
+        
         if query.isdigit() and int(query) >= 1000:
             extracted_numbers.append(query)
-
+        
         if extracted_numbers and 'model_standard' in self.models_df.columns:
             for number in extracted_numbers:
-                # DB 값도 정규화하여 비교 (* 로 통일)
-                mask = self.models_df['model_standard'].astype(str).apply(
-                    lambda x: number in self._normalize_search_string(x)
-                )
+                mask = self.models_df['model_standard'].astype(str).str.contains(number, case=False, na=False)
                 matched = self.models_df[mask]
-
+                
                 for _, row in matched.iterrows():
                     results.append({
                         'model': row.to_dict(),
@@ -3159,30 +2447,17 @@ class EnhancedModelSearch:
                         'match_column': 'model_standard',
                         'match_value': row['model_standard']
                     })
-
+        
         return results
     
-    def _normalize_search_string(self, s: str) -> str:
-        """검색 문자열 정규화: x 와 * 를 모두 * 로 통일"""
-        if not isinstance(s, str):
-            return str(s)
-        # x, X 를 * 로 변환 (DB 표준 형식에 맞춤)
-        return s.replace('x', '*').replace('X', '*').lower()
-
     def _search_in_column(self, query, column):
-        """특정 컬럼에서 부분 검색 (정규화된 문자열 비교)"""
+        """특정 컬럼에서 부분 검색"""
         results = []
-
+        
         try:
-            # 검색 쿼리 정규화
-            normalized_query = self._normalize_search_string(query)
-
-            # DB 값도 정규화하여 비교
-            mask = self.models_df[column].astype(str).apply(
-                lambda x: normalized_query in self._normalize_search_string(x)
-            )
+            mask = self.models_df[column].astype(str).str.contains(query, case=False, na=False)
             matched = self.models_df[mask]
-
+            
             for _, row in matched.iterrows():
                 results.append({
                     'model': row.to_dict(),
@@ -3192,7 +2467,7 @@ class EnhancedModelSearch:
                 })
         except Exception:
             pass
-
+        
         return results
     
     def _remove_duplicates_and_score(self, search_results, query):
@@ -3354,348 +2629,6 @@ def show_unified_search_tips():
     """)
 
 
-# ============================================================================
-# 문서 관리 기능 (검색, 다운로드, 업로드)
-# ============================================================================
-
-def parse_search_input(search_input: str) -> tuple[str, str]:
-    """
-    사용자 입력을 파싱하여 프로젝트명과 문서타입 분리
-
-    입력: "샘플 견적서"
-    출력: ("샘플", "quotation")
-
-    지원 문서타입:
-    - "견적서" → "quotation"
-    - "발주서" → "po"
-    - "내역서" → "bom"
-    """
-    search_lower = search_input.lower().strip()
-
-    # 문서타입 매핑
-    doc_type_map = {
-        "견적서": "quotation",
-        "발주서": "po",
-        "내역서": "bom",
-    }
-
-    # 마지막 단어가 문서타입인지 확인
-    for korean_type, english_type in doc_type_map.items():
-        if search_lower.endswith(korean_type):
-            project_name = search_input[:-(len(korean_type))].strip()
-            return project_name, english_type
-
-    # 문서타입을 찾지 못한 경우 전체를 프로젝트명으로 처리
-    return search_input.strip(), ""
-
-
-def search_documents(db, tenant_id: str, project_name: str, document_type: str) -> list:
-    """
-    DB에서 문서 검색
-
-    Args:
-        db: DatabaseManager 인스턴스
-        tenant_id: 테넌트 ID
-        project_name: 프로젝트명 (부분 검색)
-        document_type: 문서타입 (quotation/po/bom)
-
-    Returns:
-        검색 결과 (딕셔너리 리스트)
-    """
-    try:
-        query = db.table('document_archive').select('*').eq('tenant_id', tenant_id)
-
-        # 프로젝트명 검색 (부분 일치)
-        if project_name:
-            query = query.ilike('project_name', f'%{project_name}%')
-
-        # 문서타입 필터 (정확 일치)
-        if document_type:
-            query = query.eq('document_type', document_type)
-
-        # 생성 날짜 역순 정렬
-        query = query.order('created_at', desc=True)
-
-        result = query.execute()
-        return result.data or []
-    except Exception as e:
-        st.error(f"검색 중 오류 발생: {e}")
-        return []
-
-
-def generate_document_filename(db, project_name: str, document_type_korean: str) -> str:
-    """
-    DB 규칙에 맞는 파일명 생성
-
-    규칙: {현장명}_{문서타입}_{날짜}_v{버전}.xlsx
-    예: 샘플초등학교_견적서_251022_v01.xlsx
-
-    Args:
-        db: Supabase 클라이언트
-        project_name: 현장명 (예: "샘플초등학교")
-        document_type_korean: 문서타입 한글 (예: "견적서", "발주서", "내역서")
-
-    Returns:
-        생성된 파일명
-    """
-    from datetime import datetime
-
-    date_str = datetime.now().strftime('%y%m%d')
-
-    # 문서타입 영문 변환
-    doc_type_map = {
-        "견적서": "quotation",
-        "발주서": "po",
-        "내역서": "bom",
-    }
-    document_type_eng = doc_type_map.get(document_type_korean, "")
-
-    try:
-        # DB에서 같은 날짜의 같은 프로젝트/문서타입 파일 개수 확인
-        base_filename = f"{project_name}_{document_type_korean}_{date_str}"
-        results = db.table('document_archive').select('filename').ilike(
-            'filename', f'{base_filename}%'
-        ).execute()
-
-        # 기존 파일 개수 + 1 = 다음 버전
-        version = len(results.data) + 1 if results.data else 1
-    except:
-        version = 1
-
-    return f"{project_name}_{document_type_korean}_{date_str}_v{version:02d}.xlsx"
-
-
-def validate_filename(filename: str) -> tuple[bool, str, dict]:
-    """
-    파일명 규칙 검증: {현장명}_{문서타입}_{날짜}_v{버전}.xlsx
-
-    예: 샘플초등학교_견적서_251022_v01.xlsx
-
-    Returns:
-        (유효여부, 에러메시지, 파싱된_데이터)
-    """
-    import re
-
-    if not filename.endswith('.xlsx'):
-        return False, "Excel 파일만 업로드 가능합니다 (.xlsx)", {}
-
-    # 확장자 제거
-    name_without_ext = filename[:-5]
-
-    # 패턴: {현장명}_{문서타입}_{날짜}_v{버전}
-    # 문서타입: 견적서, 발주서, 내역서
-    pattern = r'^(.+?)_(견적서|발주서|내역서)_(\d{6})_v(\d+)$'
-    match = re.match(pattern, name_without_ext)
-
-    if not match:
-        return False, (
-            "파일명 규칙을 맞춰주세요.\n"
-            "형식: {현장명}_{문서타입}_{날짜}_v{버전}.xlsx\n"
-            "예: 샘플초등학교_견적서_251022_v01.xlsx"
-        ), {}
-
-    project_name, doc_type_korean, date_str, version = match.groups()
-
-    # 한글 문서타입을 영문으로 변환
-    doc_type_map = {
-        "견적서": "quotation",
-        "발주서": "po",
-        "내역서": "bom",
-    }
-    doc_type_eng = doc_type_map.get(doc_type_korean, "")
-
-    return True, "", {
-        "project_name": project_name,
-        "document_type": doc_type_eng,
-        "doc_type_korean": doc_type_korean,
-        "date_str": date_str,
-        "version": int(version),
-    }
-
-
-def upload_document_to_archive(
-    db,
-    storage_manager,
-    tenant_id: str,
-    username: str,
-    file_bytes: bytes,
-    filename: str,
-    parsed_data: dict
-):
-    """
-    파일을 Storage + DB에 저장
-
-    Returns:
-        (성공여부, 메시지)
-    """
-    try:
-        # Storage에 업로드 (sanitized 경로 반환)
-        success, result = storage_manager.upload_file(
-            tenant_id=tenant_id,
-            document_type=parsed_data['document_type'],
-            document_id=parsed_data['project_name'],
-            file_bytes=file_bytes,
-            filename=filename
-        )
-
-        if not success:
-            return False, f"Storage 업로드 실패: {result}"
-
-        # result는 storage_manager가 반환한 sanitized 경로
-        storage_path = result
-
-        # DB에 메타데이터 저장
-        import uuid
-        from datetime import datetime
-
-        archive_data = {
-            "id": str(uuid.uuid4()),
-            "tenant_id": tenant_id,
-            "project_id": parsed_data['project_name'],
-            "project_name": parsed_data['project_name'],
-            "document_type": parsed_data['document_type'],
-            "storage_path": storage_path,
-            "filename": filename,
-            "file_size": len(file_bytes),
-            "created_at": datetime.utcnow().isoformat(),
-            "created_by": username,
-            "updated_at": datetime.utcnow().isoformat(),
-        }
-
-        response = db.table('document_archive').insert(archive_data).execute()
-
-        if not response.data:
-            # Storage에 업로드된 파일 삭제
-            storage_manager.delete_file(storage_path)
-            return False, "DB 저장 실패"
-
-        return True, f"✅ {filename} 업로드 완료"
-    except Exception as e:
-        return False, f"업로드 중 오류: {str(e)}"
-
-
-def delete_document_from_archive(
-    db,
-    storage_manager,
-    document_id: str,
-    storage_path: str
-):
-    """
-    문서를 Storage + DB에서 삭제
-
-    Returns:
-        (성공여부, 메시지)
-    """
-    try:
-        # Storage에서 삭제
-        if not storage_manager.delete_file(storage_path):
-            return False, "Storage 삭제 실패"
-
-        # DB에서 삭제
-        response = db.table('document_archive').delete().eq('id', document_id).execute()
-
-        if response.data:
-            return True, "✅ 문서가 삭제되었습니다"
-        else:
-            return False, "DB 삭제 실패"
-    except Exception as e:
-        return False, f"삭제 중 오류: {str(e)}"
-
-
-def save_generated_document_to_archive(
-    db,
-    tenant_id: str,
-    project_name: str,
-    document_type_korean: str,
-    file_buffer,
-    username: str = None
-) -> tuple[bool, str]:
-    """
-    생성된 문서를 document_archive에 저장
-
-    Args:
-        db: Supabase 클라이언트 (qs.engine.db)
-        tenant_id: 테넌트 ID
-        project_name: 현장명
-        document_type_korean: 문서타입 한글 ("견적서", "발주서", "내역서")
-        file_buffer: BytesIO 파일 버퍼
-        username: 생성자명 (기본값: tenant_id)
-
-    Returns:
-        (성공여부, 메시지)
-    """
-    try:
-        from app.storage_manager import get_storage_manager
-        import uuid
-        from datetime import datetime
-
-        storage_manager = get_storage_manager()
-
-        # 파일명 생성 (DB 규칙, 버전 자동 증가)
-        filename = generate_document_filename(db, project_name, document_type_korean)
-
-        # 파일 바이트 추출
-        if hasattr(file_buffer, 'getvalue'):
-            file_bytes = file_buffer.getvalue()
-        else:
-            file_bytes = file_buffer
-
-        # 문서타입 영문 변환
-        doc_type_map = {
-            "견적서": "quotation",
-            "발주서": "po",
-            "내역서": "bom",
-        }
-        document_type_eng = doc_type_map.get(document_type_korean, "")
-
-        if not document_type_eng:
-            return False, f"지원하지 않는 문서타입: {document_type_korean}"
-
-        # Storage에 업로드 (sanitized 경로 반환)
-        success, result = storage_manager.upload_file(
-            tenant_id=tenant_id,
-            document_type=document_type_eng,
-            document_id=project_name,
-            file_bytes=file_bytes,
-            filename=filename
-        )
-
-        if not success:
-            return False, f"Storage 업로드 실패: {result}"
-
-        # result는 storage_manager가 반환한 sanitized 경로
-        storage_path = result
-
-        # DB에 메타데이터 저장
-        archive_data = {
-            "id": str(uuid.uuid4()),
-            "tenant_id": tenant_id,
-            "project_id": project_name,
-            "project_name": project_name,
-            "document_type": document_type_eng,
-            "storage_path": storage_path,
-            "filename": filename,
-            "file_size": len(file_bytes),
-            "created_at": datetime.utcnow().isoformat(),
-            "created_by": username or tenant_id,
-            "updated_at": datetime.utcnow().isoformat(),
-        }
-
-        response = db.table('document_archive').insert(archive_data).execute()
-
-        if not response.data:
-            storage_manager.delete_file(storage_path)
-            error_msg = getattr(response, 'error', 'Unknown error')
-            return False, f"DB 저장 실패: {error_msg}"
-
-        return True, f"✅ {filename} 저장 완료"
-
-    except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        return False, f"문서 저장 중 오류: {str(e)}\n{error_details}"
-
-
 # 메인 애플리케이션
 def main(mode="pilot"):
     # Initialize session state for debug messages
@@ -3712,7 +2645,8 @@ def main(mode="pilot"):
     }
     
     tenant_info = tenant_config.get(tenant_id, tenant_config['dooho'])
-
+    
+    st.header(f"🖥️ {tenant_info['display_name']} 업무자동화 시스템 v{APP_VERSION}")
     st.markdown("---")
     
     # 업체 변경 UI (사이드바) - 파일럿 모드일 때만 표시

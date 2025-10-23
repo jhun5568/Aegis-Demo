@@ -39,7 +39,7 @@ class LicenseManager:
 
             # 1. 활성화 상태 체크
             if not tenant.get('is_active', False):
-                return False, f"❌ 서비스가 중지되었습니다.\n\n관리자에게 문의하세요.\n담당자: {tenant.get('contact_email', 'jhun5568@gmail.com')}", tenant
+                return False, f"❌ 서비스가 중지되었습니다.\n\n관리자에게 문의하세요.\n담당자: {tenant.get('contact_email', 'N/A')}", tenant
 
             # 2. 만료일 체크
             expires_at = tenant.get('license_expires_at')
@@ -50,7 +50,7 @@ class LicenseManager:
                     now = datetime.now(expire_date.tzinfo)
 
                     if now > expire_date:
-                        return False, f"❌ 라이선스가 만료되었습니다.\n\n만료일: {expire_date.strftime('%Y년 %m월 %d일')}\n담당자: {tenant.get('contact_email', 'jhun5568@gmail.com')}", tenant
+                        return False, f"❌ 라이선스가 만료되었습니다.\n\n만료일: {expire_date.strftime('%Y년 %m월 %d일')}\n담당자: {tenant.get('contact_email', 'N/A')}", tenant
 
                     # 만료 7일 전 경고
                     days_left = (expire_date - now).days
@@ -129,8 +129,8 @@ def check_and_enforce_license(supabase_client, tenant_id: str) -> bool:
         st.markdown("---")
         st.markdown("### 📞 문의")
         st.info(f"""
-        **담당자 이메일**: {info.get('contact_email', 'jhun5568@gmail.com')}
-        **연락처**: {info.get('contact_phone', '010-3812-7644')}
+        **담당자 이메일**: {info.get('contact_email', 'admin@example.com')}
+        **연락처**: {info.get('contact_phone', 'N/A')}
         """)
         st.stop()
 

@@ -10,11 +10,9 @@ import os
 from contextlib import contextmanager
 import time
 
-# ✅ 데이터베이스 매니저 캐시로 성능 개선
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def get_db_manager():
-    """데이터베이스 매니저 (캐싱됨)"""
-    print("🚀 데이터베이스 매니저를 초기화합니다...")
+    print("🚀 데이터베이스 매니저를 초기화합니다... (이 메시지는 한 번만 보여야 합니다)")
     return DatabaseManager()
 
 # 성능 모니터링 데코레이터만 유지
@@ -109,6 +107,7 @@ class DatabaseManager:
             print("✅ SQLite 모드로 실행 중")
             
     @contextmanager
+    @st.cache_data
     def get_connection(_self):
         """데이터베이스 연결 컨텍스트 매니저"""
         conn = sqlite3.connect(_self.db_path)
@@ -439,7 +438,7 @@ class DatabaseManager:
     # ========================================================================
     # CRUD - 발주 (Orders)
     # ========================================================================
-    @st.cache_data(ttl=3600)  # 1시간 캐시 (성능 개선)
+    @st.cache_data(ttl=300)
     def get_orders(_self, customer_id=None):
         """발주 목록 조회 - Supabase/SQLite 분기"""
         
@@ -528,13 +527,14 @@ class DatabaseManager:
             query = f"UPDATE orders SET {set_clause} WHERE order_id = ?"
             cursor.execute(query, values)
             return cursor.rowcount > 0
+    @st.cache_data(ttl=300)
     def delete_order(_self, order_id):
         """발주 삭제 (연관된 items, events도 자동 삭제)"""
         with _self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM orders WHERE order_id = ?", (order_id,))
             return cursor.rowcount > 0
-    @st.cache_data(ttl=3600)  # 1시간 캐시
+    @st.cache_data(ttl=300)
     def get_order_by_id(_self, order_id):
         """특정 발주 조회 - Supabase/SQLite 분기"""
         
@@ -568,7 +568,7 @@ class DatabaseManager:
     # ========================================================================
     # CRUD - 발주 품목 (Order Items)
     # ========================================================================
-    @st.cache_data(ttl=3600)  # 1시간 캐시
+    @st.cache_data(ttl=300)
     def get_order_items(_self, order_id):
         """특정 발주의 품목 조회"""
         with _self.get_connection() as conn:
@@ -599,7 +599,7 @@ class DatabaseManager:
     # ========================================================================
     # CRUD - 공정 이벤트 (Process Events)
     # ========================================================================
-    @st.cache_data(ttl=600)  # 10분 캐시
+    @st.cache_data(ttl=60)
     def get_process_events(_self, order_id=None):
         """공정 이벤트 조회 - Supabase/SQLite 분기"""
         
@@ -646,13 +646,13 @@ class DatabaseManager:
                         df[col] = pd.to_datetime(df[col], errors='coerce').dt.date
                 
                 return df
-    # mutation: do not cache
+    @st.cache_data(ttl=60)
     def add_process_event(_self, order_id, stage, progress=0, 
                         planned_date=None, done_date=None, vendor=None, note=""):
         """공정 이벤트 추가 - Supabase/SQLite 분기"""
         
         if USE_SUPABASE:
-            # Supabase 버전 - 성능 최적화
+            # Supabase 버전
             data = {
                 'order_id': order_id,
                 'stage': stage,
@@ -660,32 +660,16 @@ class DatabaseManager:
                 'planned_date': str(planned_date) if planned_date else None,
                 'done_date': str(done_date) if done_date else None,
                 'vendor': vendor,
-                'note': note,
-                'created_at': datetime.utcnow().isoformat()
+                'note': note
             }
+            _self.supabase.table('process_events').insert(data).execute()
             
-            # ⚡ 성능 최적화: 단일 API 호출로 병합
-            try:
-                # 이벤트 추가
-                _self.supabase.table('process_events').insert(data).execute()
-
-                # 완료 처리일 때만 현재 공정 단계 갱신 및 상태 업데이트
-                if progress >= 100 or done_date:
-                    _self.supabase.table('orders').update({
-                        'current_stage': stage,
-                        'status': '완료'
-                    }).eq('order_id', order_id).execute()
-                else:
-                    # 해제(미완료 전환) 시 상태를 진행중으로 되돌림
-                    _self.supabase.table('orders').update({
-                        'status': '진행중'
-                    }).eq('order_id', order_id).execute()
-
-                return True
-                
-            except Exception as e:
-                print(f"⚠️ 이벤트 추가 실패 ({order_id}, {stage}): {e}")
-                return False
+            # orders 테이블 업데이트
+            _self.supabase.table('orders').update({
+                'current_stage': stage
+            }).eq('order_id', order_id).execute()
+            
+            return True
         
         else:
             # SQLite 버전
@@ -696,26 +680,15 @@ class DatabaseManager:
                     (order_id, stage, progress, planned_date, done_date, vendor, note)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (order_id, stage, progress, planned_date, done_date, vendor, note))
-                # 완료 처리일 때만 현재 공정 단계 갱신
-                if progress >= 100 or (done_date is not None):
-                    cursor.execute("""
-                        UPDATE orders 
-                        SET current_stage = ?,
-                            status = '완료',
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE order_id = ?
-                    """, (stage, order_id))
-                else:
-                    # 해제 시 진행중으로 되돌림
-                    cursor.execute("""
-                        UPDATE orders
-                        SET status = '진행중',
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE order_id = ?
-                    """, (order_id,))
+                cursor.execute("""
+                    UPDATE orders 
+                    SET current_stage = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE order_id = ?
+                """, (stage, order_id))
 
                 return True
-    @st.cache_data(ttl=600)  # 10분 캐시
+    @st.cache_data(ttl=60)
     def get_latest_events_by_stage(_self, order_id):
         """발주별 각 공정의 최신 이벤트 조회 - Supabase/SQLite 분기"""
         
@@ -734,24 +707,10 @@ class DatabaseManager:
             
             # 각 공정(process_stage)별로 최신 이벤트만 추출
             # stage 컬럼이 있는지 확인하고 그룹화
-            # created_at 기준 정렬 후 공정별 최신 1건만 유지
-            try:
-                if 'created_at' in df.columns:
-                    df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce')
-                sort_cols = []
-                if 'created_at' in df.columns:
-                    sort_cols.append('created_at')
-                if 'event_id' in df.columns:
-                    sort_cols.append('event_id')
-                if sort_cols:
-                    df = df.sort_values(sort_cols, ascending=[False]*len(sort_cols))
-            except Exception:
-                pass
-
             if 'stage' in df.columns:
-                latest_events = df.drop_duplicates(subset='stage', keep='first')
+                latest_events = df.groupby('stage').first().reset_index()
             elif 'process_stage' in df.columns:
-                latest_events = df.drop_duplicates(subset='process_stage', keep='first')
+                latest_events = df.groupby('process_stage').first().reset_index()
             else:
                 latest_events = df
             
@@ -770,7 +729,7 @@ class DatabaseManager:
                 query = """
                     SELECT * FROM process_events
                     WHERE order_id = ?
-                    ORDER BY created_at DESC, event_id DESC
+                    ORDER BY created_at DESC
                 """
                 df = pd.read_sql_query(query, conn, params=(order_id,))
                 
@@ -786,28 +745,12 @@ class DatabaseManager:
                         latest_events[col] = pd.to_datetime(latest_events[col], errors='coerce').dt.date
                 if 'created_at' in latest_events.columns:
                     latest_events['created_at'] = pd.to_datetime(latest_events['created_at'], errors='coerce')
-                # 정렬 안정화: 동일 타임스탬프 시 event_id 기준으로 최신 선택
-                try:
-                    base_df = df.copy() if 'df' in locals() else latest_events
-                    if 'created_at' in base_df.columns:
-                        base_df['created_at'] = pd.to_datetime(base_df['created_at'], errors='coerce')
-                    sort_cols = []
-                    if 'created_at' in base_df.columns:
-                        sort_cols.append('created_at')
-                    if 'event_id' in base_df.columns:
-                        sort_cols.append('event_id')
-                    if sort_cols:
-                        base_df = base_df.sort_values(sort_cols, ascending=[False]*len(sort_cols))
-                    if 'stage' in base_df.columns:
-                        latest_events = base_df.drop_duplicates(subset='stage', keep='first')
-                except Exception:
-                    pass
                 
                 return latest_events
     # ========================================================================
     # CRUD - 프로젝트 (Projects)
     # ========================================================================
-    @st.cache_data(ttl=3600)  # 1시간 캐시    
+    @st.cache_data(ttl=300)    
     def get_projects(_self, customer_id=None):
         """프로젝트 목록 조회 - Supabase/SQLite 분기"""
         
@@ -842,8 +785,7 @@ class DatabaseManager:
                 
                 return df
     
-    def add_project(_self, project_id, project_name, customer_id, final_due_date,
-                    status="진행중", memo="", contract_type="관급", contract_amount=0):
+    def add_project(_self, project_id, project_name, customer_id, final_due_date, status="진행중", memo=""):
         """프로젝트 추가 - Supabase/SQLite 분기"""
         
         if USE_SUPABASE:
@@ -854,9 +796,7 @@ class DatabaseManager:
                 'customer_id': customer_id,
                 'final_due_date': str(final_due_date),
                 'status': status,
-                'memo': memo,
-                'contract_type': contract_type,
-                'contract_amount': contract_amount
+                'memo': memo
             }
             _self.supabase.table('projects').insert(data).execute()
             return True
@@ -867,11 +807,11 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 cursor.execute("""
                     INSERT INTO projects 
-                    (project_id, project_name, customer_id, final_due_date, status, memo, contract_type, contract_amount)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (project_id, project_name, customer_id, final_due_date, status, memo, contract_type, contract_amount))
+                    (project_id, project_name, customer_id, final_due_date, status, memo)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (project_id, project_name, customer_id, final_due_date, status, memo))
                 return True
-    @st.cache_data(ttl=3600)  # 1시간 캐시
+    @st.cache_data(ttl=300)
     def get_project_by_id(_self, project_id):
         """특정 프로젝트 조회 - Supabase/SQLite 분기"""
         
@@ -900,7 +840,7 @@ class DatabaseManager:
                         df['final_due_date'] = pd.to_datetime(df['final_due_date'], errors='coerce').dt.date
                     return df.iloc[0]
                 return None
-    @st.cache_data(ttl=3600)  # 1시간 캐시
+    @st.cache_data(ttl=300)
     def get_project_by_name(_self, project_name, customer_id=None):
         """프로젝트명으로 조회 - Supabase/SQLite 분기"""
         
@@ -983,7 +923,7 @@ class DatabaseManager:
                 return order_id
         
     # ==================== 통계 함수 (v0.5) ====================
-    @st.cache_data(ttl=600)  # 10분 캐시
+    @st.cache_data
     def get_sales_statistics(_self, year=None, month=None, customer_id=None):
         """매출 통계 조회 - Supabase/SQLite 분기"""
         
@@ -1074,7 +1014,7 @@ class DatabaseManager:
                     })
                 
                 return results
-    @st.cache_data(ttl=600)  # 10분 캐시
+    @st.cache_data
     def get_monthly_sales_trend(_self, months=12, customer_id=None):
         """월별 매출 추이 - Supabase/SQLite 분기"""
         
@@ -1159,7 +1099,7 @@ class DatabaseManager:
                     })
                 
                 return results
-    @st.cache_data(ttl=600)  # 10분 캐시
+    @st.cache_data
     def get_contract_type_ratio(_self, year=None, customer_id=None):
         """관급/사급 비율 - Supabase/SQLite 분기"""
         
@@ -1238,7 +1178,7 @@ class DatabaseManager:
                     })
                 
                 return results
-    @st.cache_data(ttl=600)  # 10분 캐시
+    @st.cache_data
     def get_top_projects_by_amount(_self, limit=10, year=None, customer_id=None):
         """계약금액 상위 프로젝트 - Supabase/SQLite 분기"""
         
@@ -1405,7 +1345,7 @@ class WIPManager:
             'current_stage': current_stage,
             'stage_status': stage_status
         }
-    @st.cache_data(ttl=3600)  # 1시간 캐시
+    @st.cache_data(ttl=300)
     def get_orders_with_progress(_self, customer_id=None):
         """진행률이 포함된 발주 목록 조회"""
         orders = _self.db.get_orders(customer_id)
@@ -1675,32 +1615,28 @@ class WIPManager:
         
         print("✅ 샘플 데이터 생성 완료")
         return True
-    @st.cache_data(ttl=3600)  # 1시간 캐시
+    @st.cache_data(ttl=300)
     def get_projects_with_orders(_self, customer_id=None):
-        """프로젝트별 발주 현황 집계 (최적화: 배치 프로세스 이벤트 로드)"""
+        """프로젝트별 발주 현황 집계"""
         projects = _self.db.get_projects(customer_id)
-
+        
         if projects.empty:
             return pd.DataFrame()
-
+        
         result = []
-        # ⚡ 최적화: 모든 프로세스 이벤트를 한 번에 로드
-        all_events = _self.db.get_process_events()  # order_id별로 필터링되지 않음
-
-        # fetch orders once to avoid repeated cached calls
-        orders_all = _self.db.get_orders()
         for _, project in projects.iterrows():
-            project_orders = orders_all[orders_all['project_id'] == project['project_id']]
-
+            orders = _self.db.get_orders()
+            project_orders = orders[orders['project_id'] == project['project_id']]
+            
             if not project_orders.empty:
                 total_orders = len(project_orders)
                 completed_orders = 0
-
+                
                 for _, order in project_orders.iterrows():
                     order_parts = order['order_id'].split('-')
                     if len(order_parts) >= 3:
                         process_type = order_parts[2]
-
+                        
                         process_map = {
                             'CUT': '절단/절곡',
                             'PLASER': 'P레이저',
@@ -1710,32 +1646,30 @@ class WIPManager:
                             'STICKER': '스티커',
                             'RECEIVING': '입고'
                         }
-
+                        
                         target_stage = process_map.get(process_type)
-
+                        
                         if target_stage:
-                            # ⚡ 최적화: 메모리 필터링 (DB 쿼리 없음)
-                            events = all_events[all_events['order_id'] == order['order_id']]
-
-                            # 빈 DataFrame 체크
+                            events = _self.db.get_process_events(order['order_id'])
+                            # 🆕 빈 DataFrame 체크 추가
                             if events.empty:
                                 continue
-
+                                
                             stage_events = events[events['stage'] == target_stage]
-
+                            
                             if not stage_events.empty:
                                 latest_event = stage_events.iloc[0]
                                 is_done = pd.notna(latest_event.get('done_date')) or latest_event.get('progress', 0) >= 100
-
+                                
                                 if is_done:
                                     completed_orders += 1
-
+                
                 total_progress = int((completed_orders / total_orders) * 100) if total_orders > 0 else 0
             else:
                 total_progress = 0
-
+            
             warning_level, d_day = _self.get_project_warning_level(project['final_due_date'])
-
+            
             result.append({
                 'project_id': project['project_id'],
                 'project_name': project['project_name'],
@@ -1753,7 +1687,7 @@ class WIPManager:
                 'warning_level': warning_level,
                 'd_day': d_day
             })
-
+        
         return pd.DataFrame(result)
     
     def update_project_installation(_self, project_id, completed_date=None, staff_count=None, days=None):
@@ -1844,16 +1778,16 @@ class WIPManager:
                     return True
                 
                 return False
-    @st.cache_data(ttl=3600)  # 1시간 캐시
+    @st.cache_data(ttl=300)
     def get_project_completion_status(_self, project_id):
         """프로젝트 완료 조건 체크 (관급/사급 구분)"""
         project = _self.db.get_project_by_id(project_id)
         if project is None:
             return {'completed': False, 'reason': '프로젝트를 찾을 수 없습니다'}
-
+        
         orders = _self.db.get_orders()
         project_orders = orders[orders['project_id'] == project_id]
-
+        
         if project_orders.empty:
             return {'completed': False, 'reason': '발주 내역이 없습니다'}
         
@@ -1931,7 +1865,7 @@ class WIPManager:
     def auto_update_project_status(_self, project_id):
         """프로젝트 상태 자동 업데이트 - Supabase/SQLite 분기"""
         completion_status = _self.get_project_completion_status(project_id)
-
+        
         if completion_status['completed']:
             # 완료 조건 충족 → 완료로 변경
             if USE_SUPABASE:
@@ -1973,7 +1907,7 @@ class WIPManager:
                 return True
         
         return False
-    @st.cache_data(ttl=3600)  # 1시간 캐시
+    @st.cache_data(ttl=300)
     def get_project_warning_level(_self, final_due_date):
         """프로젝트 납기 경고 레벨 반환"""
         if pd.isna(final_due_date):
@@ -2183,28 +2117,6 @@ class WIPManager:
             st.code(traceback.format_exc())
             return None
         
-    def update_project_name(_self, project_id, project_name):
-        """프로젝트명 업데이트 - Supabase/SQLite 분기"""
-        try:
-            if USE_SUPABASE:
-                _self.db.supabase.table('projects').update({
-                    'project_name': project_name
-                }).eq('project_id', project_id).execute()
-                return True
-            else:
-                with _self.db.get_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        UPDATE projects
-                        SET project_name = ?
-                        WHERE project_id = ?
-                    """, (project_name, project_id))
-                    return True
-        except Exception as e:
-            import streamlit as st
-            st.error(f"프로젝트명 업데이트 실패: {e}")
-            return False
-
     def update_project_amount(_self, project_id, amount):
         """프로젝트 계약금액 업데이트 - Supabase/SQLite 분기"""
         try:
@@ -2217,7 +2129,7 @@ class WIPManager:
                 with _self.db.get_connection() as conn:
                     cursor = conn.cursor()
                     cursor.execute("""
-                        UPDATE projects
+                        UPDATE projects 
                         SET contract_amount = ?
                         WHERE project_id = ?
                     """, (amount, project_id))
@@ -2783,142 +2695,67 @@ class WIPInterface:
         
         st.caption("✅ 완료 | ⚪ 진행중/대기 | - 해당없음")
 
-        # 업체 변경 및 완료 처리 UI (배치 편집 방식)
+        # 업체 변경 및 완료 처리 UI
         st.markdown("---")
 
-        # 📌 expander 상태 저장 (리프레쉬 시에도 열린 상태 유지)
-        expander_key = f"expander_{project_id}"
-        if expander_key not in st.session_state:
-            st.session_state[expander_key] = False
-
-        with st.expander("🔧 업체 변경 및 완료 처리", expanded=st.session_state[expander_key]):
-            # expander가 열렸으므로 상태 저장
-            st.session_state[expander_key] = True
-
-            # 📋 배치 편집용 session_state 초기화
-            batch_edit_key = f"batch_edits_{project_id}"
-            if batch_edit_key not in st.session_state:
-                st.session_state[batch_edit_key] = {}
-
-            batch_edits = st.session_state[batch_edit_key]
-
+        with st.expander("🔧 업체 변경 및 완료 처리", expanded=False):
             for stage, data_list in stage_buttons.items():
                 if data_list:
-                    st.markdown(f"**{stage}**")
-
                     for idx, data in enumerate(data_list):
                         col1, col2, col3 = st.columns([2, 2, 1])
-
-                        # 고유 키
-                        edit_key = f"{stage}_{idx}"
-
+                        
                         with col1:
-                            st.caption(f"  {data['vendor']}")
-
+                            st.caption(f"**{stage}**")
+                        
                         with col2:
                             # 해당 공정 업체 목록
                             vendors_df = _self.db.get_vendors(stage)
-
+                            
                             if not vendors_df.empty:
                                 vendor_options = vendors_df['vendor_name'].tolist()
                                 # 현재 업체가 목록에 없으면 추가
                                 if data['vendor'] not in vendor_options:
                                     vendor_options.insert(0, data['vendor'])
-
+                                
                                 current_index = vendor_options.index(data['vendor']) if data['vendor'] in vendor_options else 0
-
-                                # 기존 편집 값이 있으면 그걸 사용
-                                selected_vendor = batch_edits.get(edit_key, {}).get('vendor', data['vendor'])
-                                selected_index = vendor_options.index(selected_vendor) if selected_vendor in vendor_options else 0
-
+                                
                                 new_vendor = st.selectbox(
                                     "업체",
                                     vendor_options,
-                                    index=selected_index,
+                                    index=current_index,
                                     key=f"vendor_select_{project_id}_{stage}_{idx}",
                                     label_visibility="collapsed"
                                 )
-
-                                # 선택값 저장
-                                if edit_key not in batch_edits:
-                                    batch_edits[edit_key] = {'order_id': data['order_id'], 'vendor': new_vendor}
-                                else:
-                                    batch_edits[edit_key]['vendor'] = new_vendor
                             else:
                                 new_vendor = data['vendor']
                                 st.text(data['vendor'])
-                                if edit_key not in batch_edits:
-                                    batch_edits[edit_key] = {'order_id': data['order_id'], 'vendor': new_vendor}
-
+                        
                         with col3:
-                            # ⚪ → ✅ 토글 (체크박스 대신 수정 버튼)
-                            current_status = batch_edits.get(edit_key, {}).get('is_done', data['is_done'])
-
-                            if st.checkbox(
-                                "완료",
-                                value=current_status,
-                                key=f"status_checkbox_{project_id}_{stage}_{idx}",
-                                label_visibility="collapsed"
+                            # 완료 상태 토글 버튼
+                            if st.button(
+                                "✅" if data['is_done'] else "⚪",
+                                key=f"status_btn_{project_id}_{stage}_{idx}",
+                                use_container_width=True,
+                                help="완료 상태 토글"
                             ):
-                                if edit_key not in batch_edits:
-                                    batch_edits[edit_key] = {'order_id': data['order_id'], 'vendor': new_vendor}
-                                batch_edits[edit_key]['is_done'] = True
-                            else:
-                                if edit_key not in batch_edits:
-                                    batch_edits[edit_key] = {'order_id': data['order_id'], 'vendor': new_vendor}
-                                batch_edits[edit_key]['is_done'] = False
+                                # 상태 토글 (반대로)
+                                from datetime import date as date_module
+                                new_status = not data['is_done']  # 현재 상태의 반대
+                                
+                                _self.db.add_process_event(
+                                    order_id=data['order_id'],
+                                    stage=stage,
+                                    progress=100 if new_status else 0,
+                                    done_date=date_module.today() if new_status else None,
+                                    vendor=new_vendor,
+                                    note=f"상태 변경: {'완료' if new_status else '진행중'}"
+                                )
+                                # ✅ 캐시 초기화 추가
+                                st.cache_data.clear()
 
-                    st.divider()
-
-            # 💾 일괄 저장 버튼 (한 번만!)
-            col1, col2 = st.columns([1, 4])
-            with col1:
-                if st.button("💾 일괄 저장", type="primary", use_container_width=True, key=f"batch_save_{project_id}"):
-                    if batch_edits:
-                        from datetime import date as date_module
-
-                        with st.spinner("변경사항 저장 중..."):
-                            try:
-                                # 모든 변경사항을 한 번에 저장
-                                for edit_key, edit_data in batch_edits.items():
-                                    stage = edit_key.split('_')[0]
-
-                                    _self.db.add_process_event(
-                                        order_id=edit_data['order_id'],
-                                        stage=stage,
-                                        progress=100 if edit_data.get('is_done', False) else 0,
-                                        done_date=date_module.today() if edit_data.get('is_done', False) else None,
-                                        vendor=edit_data.get('vendor', ''),
-                                        note=f"일괄 업데이트: {'완료' if edit_data.get('is_done', False) else '진행중'}"
-                                    )
-
-                                # ✅ 프로젝트 상태 자동 업데이트 (진행률 100% → 완료 여부 자동 판단)
-                                _self.wip.auto_update_project_status(project_id)
-
-                                # ✅ 캐시 초기화 (한 번만)
-                                try:
-                                    _self.db.get_process_events.clear()
-                                    _self.db.get_latest_events_by_stage.clear()
-                                    _self.db.get_orders.clear()
-                                    _self.wip.get_orders_with_progress.clear()
-                                    _self.wip.get_dashboard_stats.clear()
-                                    _self.wip.get_projects_with_orders.clear()
-                                except Exception:
-                                    pass
-
-                                st.success(f"✅ {len(batch_edits)}개 항목 저장 완료!")
-                                st.session_state[batch_edit_key] = {}  # 초기화
                                 st.rerun()
-                            except Exception as e:
-                                st.error(f"❌ 저장 실패: {e}")
-                    else:
-                        st.warning("변경된 항목이 없습니다.")
-
-            with col2:
-                if st.button("🔄 초기화", use_container_width=True, key=f"batch_reset_{project_id}"):
-                    st.session_state[batch_edit_key] = {}
-                    # expander는 열린 상태 유지
-                    st.rerun()
+                    
+                    st.divider()
         
 
     def render_project_installation_table(_self, project_id, project):
@@ -3086,16 +2923,16 @@ class WIPInterface:
                 if st.button("💾", key=f"save_{project['project_id']}", help="설치정보 저장"):
                     try:
                         edited_data = st.session_state.get(f"edited_data_{project['project_id']}")
-
+                        
                         if edited_data:
                             # 설치 정보 업데이트
-                            result = _self.wip.update_project_installation(
+                            _self.wip.update_project_installation(
                                 project['project_id'],
                                 completed_date=edited_data['date'] if pd.notna(edited_data['date']) else None,
                                 staff_count=edited_data['staff'] if edited_data['staff'] > 0 else None,
-                                days=edited_data['days'] if edited_data['days'] > 0 else None
+                                days=edited_data['days'] if edited_data['days'] > 0 else None  # ✅ install_days → days
                             )
-
+                            
                             # 사급인 경우 서류 발행 정보 업데이트
                             if edited_data['contract_type'] == '사급':
                                 _self.wip.update_project_documents(
@@ -3103,27 +2940,18 @@ class WIPInterface:
                                     tax_invoice=edited_data['tax'],
                                     trade_statement=edited_data['trade']
                                 )
-
-                            # ✅ 캐시 초기화 및 데이터 일관성 보장
-                            import time
-                            time.sleep(0.5)  # Supabase 데이터 반영 대기
-                            try:
-                                _self.db.get_projects.clear()
-                                _self.db.get_project_by_id.clear()
-                                _self.wip.get_project_completion_status.clear()
-                                _self.wip.get_projects_with_orders.clear()
-                                _self.wip.get_dashboard_stats.clear()
-                            except Exception:
-                                pass
-
-                            # 프로젝트 상태 자동 업데이트 (캐시 초기화 후)
+                            
+                            # 프로젝트 상태 자동 업데이트
                             _self.wip.auto_update_project_status(project['project_id'])
-
+                            
+                            # ✅ 캐시 초기화 추가
+                            st.cache_data.clear()
+                           
                             st.success("✅ 저장!")
                             st.rerun()
                         else:
                             st.warning("수정된 데이터가 없습니다.")
-
+             
                     except Exception as e:
                         st.error(f"❌ 저장 실패: {e}")
                         import traceback
@@ -3165,13 +2993,8 @@ class WIPInterface:
             if project_obj is not None:
                 _self.render_project_installation_table(project['project_id'], project_obj)
             
-            # 발주 상세는 토글로 (expander 상태 저장)
-            order_detail_key = f"order_detail_{project['project_id']}"
-            if order_detail_key not in st.session_state:
-                st.session_state[order_detail_key] = False
-
-            with st.expander(f"🔍 '{project['project_name']}' 발주 상세보기", expanded=st.session_state[order_detail_key]):
-                st.session_state[order_detail_key] = True  # expander가 열렸으므로 상태 저장
+            # 발주 상세는 토글로
+            with st.expander(f"🔍 '{project['project_name']}' 발주 상세보기", expanded=False):
                 _self.render_order_detail_by_project(project['project_id'], project['project_name'])
 
             st.markdown("---")
@@ -3297,13 +3120,7 @@ class WIPInterface:
                                     cursor.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
 
                             # ✅ 캐시 초기화 추가
-                            try:
-                                _self.db.get_projects.clear()
-                                _self.db.get_orders.clear()
-                                _self.db.get_process_events.clear()
-                                _self.wip.get_projects_with_orders.clear()
-                            except Exception:
-                                pass
+                            st.cache_data.clear()
                             
                             st.success(f"프로젝트 '{selected_to_delete}' 삭제 완료!")
                             st.rerun()
@@ -3326,57 +3143,18 @@ class WIPInterface:
         if filtered_df.empty:
             st.warning("필터 조건에 맞는 프로젝트가 없습니다.")
             return
-
-        # 프로젝트 선택
-        project_to_update = st.selectbox(
-            "프로젝트 선택",
-            options=filtered_df['project_id'].tolist(),
-            format_func=lambda x: f"{x} - {filtered_df[filtered_df['project_id']==x]['project_name'].values[0]}",
-            key="project_select_for_edit"
-        )
-
-        # 프로젝트명 수정 UI
-        st.subheader("📝 프로젝트명 수정")
-
-        col1, col2 = st.columns([3, 1])
-
-        with col1:
-            current_name = filtered_df[filtered_df['project_id']==project_to_update]['project_name'].values[0]
-            new_name = st.text_input(
-                "새 프로젝트명",
-                value=current_name,
-                key="project_name_input"
-            )
-
-        with col2:
-            st.write("")  # 정렬용
-            st.write("")  # 정렬용
-            if st.button("💾 프로젝트명 수정", use_container_width=True, key="btn_update_name"):
-                if new_name and new_name != current_name:
-                    if _self.wip.update_project_name(project_to_update, new_name):
-                        # ✅ 캐시 초기화 추가
-                        try:
-                            _self.db.get_projects.clear()
-                            _self.wip.get_projects_with_orders.clear()
-                            _self.wip.get_dashboard_stats.clear()
-                        except Exception:
-                            pass
-
-                        st.success("✅ 프로젝트명이 수정되었습니다!")
-                        st.rerun()
-                else:
-                    st.warning("변경사항이 없습니다.")
-
-        st.markdown("---")
-
+        
         # 프로젝트 금액 수정 UI
         st.subheader("💰 계약금액 수정")
-
+        
         col1, col2, col3 = st.columns([2, 2, 1])
-
+        
         with col1:
-            # 위에서 이미 선택된 project_to_update 사용
-            st.info(f"선택된 프로젝트: {filtered_df[filtered_df['project_id']==project_to_update]['project_name'].values[0]}")
+            project_to_update = st.selectbox(
+                "프로젝트 선택",
+                options=filtered_df['project_id'].tolist(),
+                format_func=lambda x: f"{x} - {filtered_df[filtered_df['project_id']==x]['project_name'].values[0]}"
+            )
         
         with col2:
             current_amount = filtered_df[filtered_df['project_id']==project_to_update]['contract_amount'].values[0]
@@ -3390,15 +3168,10 @@ class WIPInterface:
         with col3:
             st.write("")  # 정렬용
             st.write("")  # 정렬용
-            if st.button("💾 금액 수정", use_container_width=True, key="btn_update_amount"):
+            if st.button("💾 금액 수정", use_container_width=True):
                 if _self.wip.update_project_amount(project_to_update, new_amount):
                     # ✅ 캐시 초기화 추가
-                    try:
-                        _self.db.get_projects.clear()
-                        _self.wip.get_projects_with_orders.clear()
-                        _self.db.get_top_projects_by_amount.clear()
-                    except Exception:
-                        pass
+                    st.cache_data.clear()
 
                     st.success("✅ 계약금액이 수정되었습니다!")
                     st.rerun()
@@ -3432,10 +3205,7 @@ class WIPInterface:
                         _self.db.add_customer(customer_id, customer_name, "")
                         st.success(f"고객사 '{customer_name}' 생성 완료!")
                         # ✅ 캐시 초기화 추가
-                        try:
-                            _self.db.get_customers.clear()
-                        except Exception:
-                            pass
+                        st.cache_data.clear()
                         st.rerun()
                     except Exception as e:
                         st.error(f"고객사 생성 실패: {e}")
@@ -3513,9 +3283,7 @@ class WIPInterface:
                             customer_id,
                             final_due_date,
                             status="진행중",
-                            memo=memo,
-                            contract_type=contract_type,
-                            contract_amount=contract_amount
+                            memo=memo
                         )
 
                         # ✅ 납품요구일 추가 저장
@@ -3611,15 +3379,7 @@ class WIPInterface:
                         st.success(f"✅ 공정별 기본 발주 {len(process_list)}건이 자동 생성되었습니다!")
 
                         # ✅ 캐시 초기화 추가
-                        try:
-                            _self.db.get_project_by_id.clear()
-                            _self.db.get_projects.clear()
-                            _self.db.get_orders.clear()
-                            _self.db.get_process_events.clear()
-                            _self.wip.get_projects_with_orders.clear()
-                            _self.wip.get_dashboard_stats.clear()
-                        except Exception:
-                            pass
+                        st.cache_data.clear()
 
                         st.rerun()
                         
@@ -3918,10 +3678,21 @@ def main(allowed_tenants=None):
             # 여러 테넌트 접근 가능 시 드롭다운 표시
             prev_tenant = st.session_state.get('tenant_id')
             
-            # 단일 테넌트만 사용 (selectbox 제거)
-            selected_tenant = st.session_state.allowed_tenants[0] if st.session_state.allowed_tenants else None
-            if selected_tenant:
+            current_index = 0
+            if prev_tenant and prev_tenant in st.session_state.allowed_tenants:
+                current_index = st.session_state.allowed_tenants.index(prev_tenant)
+
+            selected_tenant = st.selectbox(
+                "업체 전환", 
+                st.session_state.allowed_tenants, 
+                index=current_index,
+                key="wip_tenant_switcher"  # 고유한 key 추가
+            )
+            
+            if selected_tenant != prev_tenant:
                 st.session_state['tenant_id'] = selected_tenant
+                st.cache_data.clear()
+                st.rerun()
         elif st.session_state.allowed_tenants:
             # 단일 테넌트만 접근 가능 시 자동으로 선택
             selected_tenant = st.session_state.allowed_tenants[0]
@@ -3946,87 +3717,67 @@ def main(allowed_tenants=None):
         
         # 필터 섹션
         st.subheader("🔍 필터")
-
-        # 세션 상태 기본값 설정
-        st.session_state.setdefault('period_type', '전체')
-        st.session_state.setdefault('filter_year', 2025)
-        st.session_state.setdefault('filter_year_month', 2025)
-        st.session_state.setdefault('filter_month', 1)
-        st.session_state.setdefault('date_criteria', '최종납기일')
-        st.session_state.setdefault('status_filter', '진행중')
-        st.session_state.setdefault('project_type_filter', '전체')
-        st.session_state.setdefault('show_completed_projects', False)
-
+        
         # 1. 기간 검색
         period_type = st.radio(
             "기간 검색",
             ["전체", "년도", "월별"],
             horizontal=True,
-            index=["전체", "년도", "월별"].index(st.session_state['period_type']),
             key="wip_period_type"
         )
-        st.session_state['period_type'] = period_type
-
+        
         if period_type == "년도":
             year = st.selectbox(
                 "년도 선택",
                 [2024, 2025, 2026],
-                index=[2024, 2025, 2026].index(st.session_state.get('filter_year', 2025)),
+                index=1,
                 key="wip_filter_year"
             )
-            st.session_state['filter_year'] = year
         elif period_type == "월별":
             col_y, col_m = st.columns(2)
             with col_y:
-                year = st.selectbox("년", [2024, 2025, 2026], index=[2024, 2025, 2026].index(st.session_state.get('filter_year_month', 2025)), key="wip_filter_year_month")
-                st.session_state['filter_year_month'] = year
+                year = st.selectbox("년", [2024, 2025, 2026], index=1, key="wip_filter_year_month")
             with col_m:
-                month = st.selectbox("월", list(range(1, 13)), index=st.session_state.get('filter_month', 1) - 1, key="wip_filter_month")
-                st.session_state['filter_month'] = month
-
+                month = st.selectbox("월", list(range(1, 13)), key="wip_filter_month")
+        
         # 기준 선택
         date_criteria = st.radio(
             "기준",
             ["최종납기일", "설치완료일"],
             horizontal=True,
-            index=["최종납기일", "설치완료일"].index(st.session_state.get('date_criteria', '최종납기일')),
             key="wip_date_criteria"
         )
-        st.session_state['date_criteria'] = date_criteria
-
+        
         st.divider()
-
+        
         # 2. 상태 필터
         status_filter = st.radio(
             "상태",
             ["전체", "진행중", "완료"],
-            index=["전체", "진행중", "완료"].index(st.session_state.get('status_filter', '진행중')),
+            index=1,
             horizontal=True,
             key="wip_status_filter"
         )
-        st.session_state['status_filter'] = status_filter
-
+        
         st.divider()
 
         # 3. 관급/사급 필터
         project_type_filter = st.radio(
             "프로젝트 유형",
             ["전체", "관급", "사급"],
-            index=["전체", "관급", "사급"].index(st.session_state.get('project_type_filter', '전체')),
             horizontal=True,
             key="wip_project_type_filter"
         )
-        st.session_state['project_type_filter'] = project_type_filter
 
         st.divider()
 
         # 완료 프로젝트 표시 토글
         show_completed = st.checkbox(
             "완료된 프로젝트 표시",
-            value=st.session_state.get('show_completed_projects', False),
+            value=False,
             help="체크 해제 시 완료된 프로젝트는 숨겨집니다"
         )
-
+        
         st.session_state['show_completed_projects'] = show_completed
 
     # 회사명 매핑
@@ -4035,6 +3786,7 @@ def main(allowed_tenants=None):
         'kukje': '국제',
     }
     company_name = company_map.get(selected_tenant, selected_tenant)
+    st.subheader(f"🗂️ {company_name} WIP 현황 관리 시스템 v0.8")
 
     # 데이터베이스 매니저를 캐시에서 가져옵니다.
     try:
@@ -4046,16 +3798,10 @@ def main(allowed_tenants=None):
         st.stop() # 여기서 멈춤
 
         # 캐싱 없이 직접 로딩
-    # ⚠️ 캐시 워밍 제거 (오히려 성능 저하 원인)
-    # @st.cache_data 데코레이터가 자동으로 캐싱 처리
-    # 수동 캐시 워밍 시: 18-20초 소요
-    # 제거 후: 필요할 때만 데이터 로드 (1-2초)
-    # if 'cache_warmed' not in st.session_state:
-    #     with st.spinner("데이터 로딩 중..."):
-    #         _ = db_manager.get_customers()
-    #         _ = db_manager.get_projects()
-    #         _ = db_manager.get_vendors()
-    #     st.session_state['cache_warmed'] = True
+    with st.spinner("데이터 로딩 중..."):
+        customers = db_manager.get_customers()
+        projects = db_manager.get_projects()
+        vendors = db_manager.get_vendors()
     
     # ========================================================================
     # 메뉴별 화면
@@ -4079,33 +3825,11 @@ def main(allowed_tenants=None):
 
 def render_dashboard_page(ui, wip_manager, customer_id=None):
     """대시보드 페이지 - 3개 탭 구조"""
-
+    
+    # KPI 카드
+    ui.render_dashboard_cards(customer_id)
+    
     st.markdown("---")
-    # 상태 유지형 섹션 전환(탭 회귀 방지)
-    section = st.radio(
-        "보기",
-        ["발주 상세", "프로젝트 요약"],
-        index=0,
-        horizontal=True,
-        key="wip_dashboard_section",
-    )
-    if section == "발주 상세":
-        st.caption("프로젝트별 상세 정보 및 발주 관리")
-        # KPI 카드 - 필요할 때만 로드 (Lazy loading)
-        ui.render_dashboard_cards(customer_id)
-        ui.render_project_summary_with_toggle(customer_id)
-        return
-    elif section == "프로젝트 요약":
-        st.caption("프로젝트 주요 정보를 한눈에 확인")
-        projects_df = wip_manager.get_projects_with_orders(customer_id)
-        if not projects_df.empty:
-            filtered_projects = wip_manager.apply_filters_to_projects(projects_df)
-            filtered_project_ids = filtered_projects['project_id'].tolist() if not filtered_projects.empty else []
-            st.session_state['filtered_project_ids'] = filtered_project_ids
-        else:
-            st.session_state['filtered_project_ids'] = []
-        ui.render_project_summary_table_simple(customer_id)
-        return
     
     # 3개 탭 생성
     tab1, tab2, tab3 = st.tabs([
@@ -4219,10 +3943,7 @@ def render_customer_page(db_manager):
                     db_manager.add_customer(customer_id, customer_name, contact)
 
                     # ✅ 캐시 초기화 추가
-                    try:
-                        db_manager.get_customers.clear()
-                    except Exception:
-                        pass
+                    st.cache_data.clear()
 
                     st.success(f"✅ 고객사 '{customer_name}'이(가) 등록되었습니다!")
                     st.rerun()
@@ -4232,20 +3953,10 @@ def render_statistics_page(ui, wip_manager, customer_id=None):
     """통계 페이지 렌더링 (v0.5 - 회사별 분리)"""
     st.subheader("📊 매출 및 프로젝트 통계")
 
-    # 사용 가능한 연도 추출
-    import pandas as pd
-    trend_data = wip_manager.db.get_monthly_sales_trend(12, customer_id)
-    year_options = ["전체"]
-
-    if trend_data:
-        df_trend = pd.DataFrame(trend_data)
-        if not df_trend.empty:
-            df_trend['year'] = df_trend['month'].astype(str).str[:4]
-            year_options = ["전체"] + sorted(df_trend['year'].unique().tolist(), reverse=True)
-
     # 기간 필터
     col1, col2 = st.columns(2)
     with col1:
+        year_options = ["전체"] + [str(y) for y in range(2020, 2026)]
         selected_year = st.selectbox("연도 선택", year_options, key="stats_year")
 
     with col2:
@@ -4262,13 +3973,18 @@ def render_statistics_page(ui, wip_manager, customer_id=None):
 
     st.markdown("---")
 
-    # 2. 월별 매출 추이 (선택한 연도 적용)
-    render_monthly_trend(wip_manager.db, year_filter, customer_id)
+    # 2. 관급/사급 비율
+    render_contract_type_ratio(wip_manager.db, year_filter, customer_id)
 
     st.markdown("---")
 
-    # 3. 연도별 총 매출액 (선택한 연도 적용)
-    render_annual_total_sales(wip_manager.db, year_filter, customer_id)
+    # 3. 월별 매출 추이
+    render_monthly_trend(wip_manager.db, customer_id)
+
+    st.markdown("---")
+
+    # 4. 상위 프로젝트
+    render_top_projects(wip_manager.db, year_filter, customer_id)
 
 
 def render_key_metrics(db, year=None, month=None, customer_id=None):
@@ -4339,35 +4055,25 @@ def render_contract_type_ratio(db, year=None, customer_id=None):
             st.progress(percentage / 100, text=f"{item['contract_type']}: {item['total_amount']:,}원 ({percentage:.1f}%)")
 
 
-def render_monthly_trend(db, year=None, customer_id=None):
+def render_monthly_trend(db, customer_id=None):
     """월별 매출 추이"""
-    year_label = year if year else "최근 12개월"
-    st.subheader(f"📉 월별 매출 추이 ({year_label})")
-
+    st.subheader("📉 월별 매출 추이 (최근 12개월)")
+    
     # 🆕 customer_id 파라미터 전달
     trend_data = db.get_monthly_sales_trend(12, customer_id)
-
+    
     if not trend_data:
         st.info("데이터가 없습니다.")
         return
-
+    
     # 데이터를 DataFrame으로 변환
     import pandas as pd
     df = pd.DataFrame(trend_data)
-
+    
     if df.empty:
         st.info("데이터가 없습니다.")
         return
-
-    # 연도 필터 적용
-    if year:
-        df['month_str'] = df['month'].astype(str)
-        df = df[df['month_str'].str.startswith(str(year))]
-
-        if df.empty:
-            st.info(f"{year}년 데이터가 없습니다.")
-            return
-
+    
     # Pivot 테이블 생성
     pivot_df = df.pivot_table(
         index='month',
@@ -4375,133 +4081,8 @@ def render_monthly_trend(db, year=None, customer_id=None):
         values='total_amount',
         fill_value=0
     ).reset_index()
-
-    # Matplotlib를 사용한 차트 (금액 표시 + 가로 레이블)
-    import matplotlib.pyplot as plt
-    import matplotlib.ticker as ticker
-    import matplotlib.font_manager as fm
-
-    # 한글 폰트 설정 - Windows 기본 폰트
-    try:
-        # Windows 시스템 폰트 경로
-        font_path = 'C:\\Windows\\Fonts\\malgun.ttf'  # 맑은 고딕
-        if not os.path.exists(font_path):
-            font_path = 'C:\\Windows\\Fonts\\gulim.ttc'  # 굴림 (fallback)
-
-        font = fm.FontProperties(fname=font_path)
-        plt.rcParams['font.family'] = font.get_name()
-    except:
-        plt.rcParams['font.sans-serif'] = ['Arial']
-
-    plt.rcParams['axes.unicode_minus'] = False
-
-    fig, ax = plt.subplots(figsize=(16, 6))
-
-    # 월별로 x위치 설정
-    x_pos = range(len(pivot_df))
-    bar_width = 0.35
-    contract_types = [col for col in pivot_df.columns if col != 'month']
-
-    # 각 contract_type별로 막대 그리기
-    for i, contract_type in enumerate(contract_types):
-        offset = (i - len(contract_types)/2 + 0.5) * bar_width
-        values = pivot_df[contract_type].values
-        bars = ax.bar([x + offset for x in x_pos], values, bar_width, label=contract_type)
-
-        # 각 막대 위에 금액 표시
-        for bar in bars:
-            height = bar.get_height()
-            if height > 0:
-                ax.text(bar.get_x() + bar.get_width()/2., height,
-                       f'{int(height):,}',
-                       ha='center', va='bottom', fontsize=17, fontweight='bold', rotation=0)
-
-    # 레이블 설정 (글자 크기 50% 증가)
-    ax.set_xlabel('월', fontsize=20, fontweight='bold')
-    ax.set_ylabel('매출액 (원)', fontsize=20, fontweight='bold')
-    ax.set_title('월별 매출 추이', fontsize=23, fontweight='bold', pad=20)
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(pivot_df['month'], rotation=0, fontsize=17)  # 가로로 표시, 글자 크기 증가
-    ax.tick_params(axis='y', labelsize=17)  # y축 글자 크기 증가
-    ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'{int(x/1000000)}M' if x >= 1000000 else f'{int(x/1000)}K'))
-    ax.legend(fontsize=15)
-    ax.grid(axis='y', alpha=0.3)
-
-    plt.tight_layout()
-    st.pyplot(fig)
-
-
-def render_annual_total_sales(db, year=None, customer_id=None):
-    """연도별 총 매출액 - 관급/사급 구분"""
-    year_label = f"{year}년" if year else "전체 기간"
-    st.subheader(f"💰 {year_label} 총 매출액")
-
-    # 🆕 customer_id 파라미터 전달
-    trend_data = db.get_monthly_sales_trend(12, customer_id)
-
-    if not trend_data:
-        st.info("데이터가 없습니다.")
-        return
-
-    # 데이터를 DataFrame으로 변환
-    import pandas as pd
-    df = pd.DataFrame(trend_data)
-
-    if df.empty:
-        st.info("데이터가 없습니다.")
-        return
-
-    # 연도 필터 적용 (year가 있으면 해당 연도만)
-    if year:
-        df['month_str'] = df['month'].astype(str)
-        df = df[df['month_str'].str.startswith(str(year))]
-
-    if df.empty:
-        st.info(f"{year}년 데이터가 없습니다.")
-        return
-
-    # 계약 구분별 총 매출액 계산
-    total_by_type = df.groupby('contract_type')['total_amount'].sum()
-
-    # 라디오 버튼으로 계약 구분 선택
-    col1, col2, col3 = st.columns([1, 2, 2])
-
-    with col1:
-        selected_type = st.radio(
-            "계약 구분",
-            options=['전체'] + list(total_by_type.index),
-            horizontal=True,
-            key="total_sales_radio"
-        )
-
-    # 선택된 계약 구분에 따라 표시
-    if selected_type == '전체':
-        total_amount = total_by_type.sum()
-        display_df = pd.DataFrame({
-            '계약 구분': total_by_type.index,
-            '매출액': [f"{int(amount):,}원" for amount in total_by_type.values]
-        })
-    else:
-        total_amount = total_by_type.get(selected_type, 0)
-        display_df = pd.DataFrame({
-            '계약 구분': [selected_type],
-            '매출액': [f"{int(total_amount):,}원"]
-        })
-
-    # 총 매출액 표시 (큰 숫자)
-    with col2:
-        st.metric(
-            label="총 매출액",
-            value=f"{int(total_amount):,}원",
-            delta=None
-        )
-
-    # 상세 데이터 표시
-    st.dataframe(
-        display_df,
-        use_container_width=True,
-        hide_index=True
-    )
+    
+    st.bar_chart(pivot_df.set_index('month'))
 
 
 def render_top_projects(db, year=None, customer_id=None):
@@ -4600,10 +4181,7 @@ def render_vendor_page(db_manager):
                     )
 
                     # ✅ 캐시 초기화 추가
-                    try:
-                        db_manager.get_vendors.clear()
-                    except Exception:
-                        pass
+                    st.cache_data.clear()
 
                     st.success(f"✅ 업체 '{vendor_name}'이(가) 등록되었습니다!")
                     st.rerun()
@@ -4631,10 +4209,7 @@ def render_vendor_page(db_manager):
                         db_manager.delete_vendor(vendor_row['vendor_id'])
 
                         # ✅ 캐시 초기화 추가
-                        try:
-                            db_manager.get_vendors.clear()
-                        except Exception:
-                            pass
+                        st.cache_data.clear()
 
                         st.success(f"✅ 업체 '{vendor_to_delete}' 삭제 완료!")
                         st.rerun()
