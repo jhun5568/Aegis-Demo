@@ -60,7 +60,7 @@ class AuthManager:
             self.client.auth.sign_out()
         except Exception:
             pass
-        for k in ["auth_user", "auth_token", "user_profile"]:
+        for k in ["auth_user", "auth_token", "user_profile", "auto_login_attempted"]:
             st.session_state.pop(k, None)
 
         # 자동 로그인 토큰도 삭제

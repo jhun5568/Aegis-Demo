@@ -21,7 +21,7 @@ def render_login(am: AuthManager):
     with st.form("login_form"):
         email = st.text_input("이메일")
         pw    = st.text_input("비밀번호", type="password")
-        remember_me = st.checkbox("🔒 자동 로그인 (30일간 유지)", value=True)
+        remember_me = st.checkbox("🔒 자동 로그인 (30일간 유지)", value=False)
         submitted = st.form_submit_button("로그인")
     if submitted:
         ok, msg = am.sign_in(email, pw, remember_me=remember_me)
