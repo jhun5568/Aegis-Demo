@@ -2226,28 +2226,6 @@ class WIPManager:
             import streamlit as st
             st.error(f"금액 업데이트 실패: {e}")
             return False
-
-    def update_project_due_date(_self, project_id, new_date):
-        """프로젝트 최종 납기일 업데이트 - Supabase/SQLite 분기"""
-        try:
-            if USE_SUPABASE:
-                _self.db.supabase.table('projects').update({
-                    'final_due_date': str(new_date)
-                }).eq('project_id', project_id).execute()
-                return True
-            else:
-                with _self.db.get_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        UPDATE projects
-                        SET final_due_date = ?
-                        WHERE project_id = ?
-                    """, (new_date, project_id))
-                    return True
-        except Exception as e:
-            import streamlit as st
-            st.error(f"납기일 업데이트 실패: {e}")
-            return False
 # ============================================================================
 # UI 컴포넌트
 # ============================================================================
@@ -3199,7 +3177,7 @@ class WIPInterface:
             st.markdown("---")
 
     def render_project_summary_table_simple(_self, customer_id=None):
-        """프로젝트 요약 테이블 - 한눈에 보기 (납기일 수정 가능)"""
+        """프로젝트 요약 테이블 - 한눈에 보기"""
         
         projects_df = _self.wip.get_projects_with_orders(customer_id)
         
@@ -3251,10 +3229,9 @@ class WIPInterface:
             days_str = f"{int(days)}일" if pd.notna(days) else ''
             
             display_data.append({
-                'project_id': project['project_id'],
                 '프로젝트명': project['project_name'],
                 '관급/사급': project.get('contract_type', '관급'),
-                '최종납기일': project['final_due_date'], # Date object for editor
+                '최종납기일': project['final_due_date'].strftime('%Y-%m-%d') if pd.notna(project['final_due_date']) else '',
                 '납기상태': status_icon,
                 '발주건수': f"{project['order_count']}건",
                 '진행률': project['total_progress'],
@@ -3267,70 +3244,33 @@ class WIPInterface:
         summary_df = pd.DataFrame(display_data)
         
         # 테이블 표시
-        edited_df = st.data_editor(
+        st.dataframe(
             summary_df,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "project_id": None, # Hide
                 "진행률": st.column_config.ProgressColumn(
                     "진행률(%)",
                     min_value=0,
                     max_value=100,
                 ),
-                "최종납기일": st.column_config.DateColumn(
-                    "최종납기일",
-                    format="YYYY-MM-DD",
-                    step=1
-                ),
-            },
-            disabled=['프로젝트명', '관급/사급', '납기상태', '발주건수', '진행률', '설치완료일', '인원', '일수', '상태'],
-            key="project_summary_editor"
+            }
         )
         
-        # 버튼 그룹 (저장, 생성, 삭제)
-        col1, col2, col3 = st.columns([1, 1, 2])
-        
+        # 신규 프로젝트 생성 및 삭제 버튼
+        col1, col2, col3 = st.columns([1, 1, 3])
         with col1:
-            if st.button("💾 납기일 저장", type="primary", use_container_width=True, key="save_due_date"):
-                updated_count = 0
-                for index, row in edited_df.iterrows():
-                    pid = row['project_id']
-                    new_date = row['최종납기일']
-                    
-                    original_row = summary_df[summary_df['project_id'] == pid]
-                    if not original_row.empty:
-                        old_date = original_row.iloc[0]['최종납기일']
-                        if pd.notna(new_date) and new_date != old_date:
-                            if _self.wip.update_project_due_date(pid, new_date):
-                                updated_count += 1
-                
-                if updated_count > 0:
-                    st.success(f"✅ {updated_count}건의 납기일이 수정되었습니다!")
-                    try:
-                        _self.db.get_projects.clear()
-                        _self.wip.get_projects_with_orders.clear()
-                        _self.wip.get_dashboard_stats.clear()
-                        _self.db.get_top_projects_by_amount.clear()
-                    except Exception:
-                        pass
-                    st.rerun()
-                else:
-                    st.info("변경사항이 없습니다.")
-
-        with col2:
             if st.button("➕ 신규 프로젝트", use_container_width=True):
                 _self.show_new_project_modal()
         
-        with col3:
+        with col2:
             # 프로젝트 삭제
             if not projects_df.empty:
                 project_names = projects_df['project_name'].tolist()
                 selected_to_delete = st.selectbox(
                     "삭제할 프로젝트",
                     ["선택..."] + project_names,
-                    key="delete_project_select",
-                    label_visibility="collapsed"
+                    key="delete_project_select"
                 )
                 
                 if selected_to_delete != "선택...":
